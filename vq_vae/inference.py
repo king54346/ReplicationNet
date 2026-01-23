@@ -1,971 +1,632 @@
-"""
-VAE推理脚本
-支持图像重构、随机生成、潜在空间插值、算术运算等功能
-
-主要改进:
-1. 兼容所有三种VAE架构 (VAE/ConvVAE/DeepConvVAE)
-2. 智能模型加载和配置推断
-3. 更多可视化选项
-4. 潜在空间探索工具
-5. 批量处理支持
-6. 更好的错误处理
-"""
-import argparse
-import json
-from pathlib import Path
-from typing import Optional, Tuple, List
-import warnings
-
 import torch
-import numpy as np
+import torch.nn.functional as F
+from torchvision import datasets, transforms
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from PIL import Image
-import torchvision
-from torchvision import transforms
-from tqdm import tqdm
-
-from model import VAE, ConvVAE, DeepConvVAE
+import numpy as np
+from pathlib import Path
+from sklearn.metrics import confusion_matrix, classification_report
+import seaborn as sns
 
 
-def load_model_from_checkpoint(
-    checkpoint_path: str,
-    device: str = 'cuda'
-) -> Tuple[torch.nn.Module, dict, str]:
+class ClassificationInference:
     """
-    智能加载模型 - 自动检测模型类型和配置
-    
-    加载策略:
-    1. 优先使用 config.json (如果存在)
-    2. 从checkpoint中读取 model_type (如果存在)
-    3. 从 state_dict 推断模型架构
-    4. 使用默认配置作为后备
-    
-    Args:
-        checkpoint_path: 检查点路径
-        device: 设备
-        
-    Returns:
-        model: 加载好的VAE模型
-        config: 模型配置字典
-        model_type: 模型类型字符串
+    分类任务推理器
+    支持两种分类器类型：
+    1. 'discrete': 在码本索引上分类
+    2. 'quantized': 在量化向量上分类
     """
-    checkpoint_dir = Path(checkpoint_path).parent
-    config_path = checkpoint_dir / 'config.json'
     
-    print(f"Loading model from: {checkpoint_path}")
+    def __init__(self, vqvae_model, classifier_model, device, 
+                 classifier_type='discrete', checkpoint_path=None):
+        self.vqvae = vqvae_model.to(device)
+        self.classifier = classifier_model.to(device)
+        self.device = device
+        self.classifier_type = classifier_type
+        
+        if checkpoint_path:
+            self.load_checkpoint(checkpoint_path)
+        
+        self.vqvae.eval()
+        self.classifier.eval()
     
-    # 加载检查点
-    checkpoint = torch.load(checkpoint_path, map_location=device)
-    state_dict = checkpoint['model_state_dict']
-    
-    # 方法1: 从配置文件加载
-    if config_path.exists():
-        print(f"✓ Found config file: {config_path}")
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+    def load_checkpoint(self, path):
+        """加载检查点"""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.vqvae.load_state_dict(checkpoint['vqvae_state'])
+        self.classifier.load_state_dict(checkpoint['classifier_state'])
         
-        model_type = config.get('model_type', 'vae')
+        # 从checkpoint中读取分类器类型
+        if 'classifier_type' in checkpoint:
+            self.classifier_type = checkpoint['classifier_type']
         
-        # 从checkpoint验证latent_dim（config.json可能不准确）
-        if 'fc_mu.weight' in state_dict:
-            actual_latent_dim = state_dict['fc_mu.weight'].shape[0]
-            config['latent_dim'] = actual_latent_dim
-        
-    # 方法2: 从checkpoint读取
-    elif 'model_type' in checkpoint:
-        print(f"✓ Found model_type in checkpoint")
-        model_type = checkpoint['model_type']
-        config = {
-            'latent_dim': checkpoint.get('latent_dim', 20),
-            'model_type': model_type
-        }
-        
-    # 方法3: 从state_dict推断
-    else:
-        print(f"⚠ Config not found, inferring from state_dict...")
-        model_type, config = infer_model_config(state_dict)
-    
-    # 创建模型
-    model = create_model_from_config(model_type, config, device)
-    
-    # 加载权重
-    try:
-        model.load_state_dict(state_dict)
-        print(f"✓ Model weights loaded successfully")
-    except RuntimeError as e:
-        print(f"⚠ Model architecture mismatch!")
-        print(f"  Error: {e}")
-        print(f"  Trying to load with strict=False...")
-        missing, unexpected = model.load_state_dict(state_dict, strict=False)
-        
-        if missing:
-            print(f"  Missing keys: {len(missing)}")
-        if unexpected:
-            print(f"  Unexpected keys: {len(unexpected)}")
-        print(f"✓ Loaded with some missing/unexpected keys")
-    
-    model.eval()
-    
-    print(f"\nModel Info:")
-    print(f"  Type: {model_type}")
-    print(f"  Latent dim: {config.get('latent_dim', 'unknown')}")
-    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    return model, config, model_type
-
-
-def infer_model_config(state_dict: dict) -> Tuple[str, dict]:
-    """从state_dict推断模型类型和配置"""
-    # 检查DeepConvVAE特征
-    has_res_blocks = any('encoder_res' in k for k in state_dict.keys())
-    has_fc_decode = 'fc_decode.weight' in state_dict
-    
-    # 检查是否是卷积层
-    first_layer_key = 'encoder.0.weight'
-    is_conv = first_layer_key in state_dict and len(state_dict[first_layer_key].shape) == 4
-    
-    latent_dim = state_dict['fc_mu.weight'].shape[0]
-    
-    if has_res_blocks and has_fc_decode:
-        # DeepConvVAE
-        model_type = 'deep_conv_vae'
-        print("  Detected: DeepConvVAE")
-        
-        # 推断通道数
-        channels = []
-        for key in sorted(state_dict.keys()):
-            if key.startswith('encoder.') and '.weight' in key:
-                w = state_dict[key]
-                if len(w.shape) == 4:
-                    channels.append(w.shape[0])
-        hidden_channels = sorted(set(channels))[:3] if channels else [32, 64, 128]
-        
-        config = {
-            'model_type': model_type,
-            'latent_dim': latent_dim,
-            'hidden_channels': hidden_channels,
-            'in_channels': 1,
-            'image_size': 28,
-            'num_res_blocks': 2
-        }
-        
-    elif is_conv:
-        # ConvVAE
-        model_type = 'conv_vae'
-        print("  Detected: ConvVAE")
-        
-        channels = []
-        for key in sorted(state_dict.keys()):
-            if key.startswith('encoder.') and '.weight' in key:
-                w = state_dict[key]
-                if len(w.shape) == 4:
-                    channels.append(w.shape[0])
-        hidden_channels = sorted(set(channels))[:2] if channels else [32, 64]
-        
-        config = {
-            'model_type': model_type,
-            'latent_dim': latent_dim,
-            'hidden_channels': hidden_channels,
-            'in_channels': 1,
-            'image_size': 28
-        }
-        
-    else:
-        # VAE (全连接)
-        model_type = 'vae'
-        print("  Detected: VAE (fully connected)")
-        
-        dims = []
-        for key in sorted(state_dict.keys()):
-            if key.startswith('encoder.') and '.weight' in key:
-                w = state_dict[key]
-                if len(w.shape) == 2:
-                    dims.append(w.shape[0])
-        hidden_dims = sorted(set(dims), reverse=True)[:2] if dims else [512, 256]
-        
-        config = {
-            'model_type': model_type,
-            'latent_dim': latent_dim,
-            'hidden_dims': hidden_dims,
-            'input_dim': 784
-        }
-    
-    return model_type, config
-
-
-def create_model_from_config(
-    model_type: str,
-    config: dict,
-    device: str
-) -> torch.nn.Module:
-    """根据配置创建模型"""
-    if model_type == 'vae':
-        model = VAE(
-            input_dim=config.get('input_dim', 784),
-            hidden_dims=config.get('hidden_dims', [512, 256]),
-            latent_dim=config.get('latent_dim', 20)
-        )
-    elif model_type == 'conv_vae':
-        model = ConvVAE(
-            in_channels=config.get('in_channels', 1),
-            image_size=config.get('image_size', 28),
-            hidden_channels=config.get('hidden_channels', [32, 64]),
-            latent_dim=config.get('latent_dim', 20)
-        )
-    elif model_type == 'deep_conv_vae':
-        model = DeepConvVAE(
-            in_channels=config.get('in_channels', 1),
-            image_size=config.get('image_size', 28),
-            hidden_channels=config.get('hidden_channels', [32, 64, 128]),
-            latent_dim=config.get('latent_dim', 32),
-            num_res_blocks=config.get('num_res_blocks', 2)
-        )
-    else:
-        raise ValueError(f"Unknown model type: {model_type}")
-    
-    return model.to(device)
-
-
-class VAEInference:
-    """VAE推理器 - 支持所有VAE架构"""
-    
-    def __init__(
-        self,
-        checkpoint_path: str,
-        device: str = 'cuda'
-    ):
-        """
-        Args:
-            checkpoint_path: 模型检查点路径
-            device: 设备
-        """
-        self.device = device if torch.cuda.is_available() else 'cpu'
-        
-        # 智能加载模型
-        self.model, self.config, self.model_type = load_model_from_checkpoint(
-            checkpoint_path,
-            self.device
-        )
-        
-        self.latent_dim = self.config['latent_dim']
-        
-        print(f"✓ Inference engine ready on {self.device}")
+        print(f"✓ Models loaded from {path}")
+        print(f"  Classifier type: {self.classifier_type}")
+        if 'metrics' in checkpoint:
+            print(f"  Epoch: {checkpoint['epoch']}")
+            for k, v in checkpoint['metrics'].items():
+                print(f"  {k}: {v}")
     
     @torch.no_grad()
-    def reconstruct(self, images: torch.Tensor) -> torch.Tensor:
+    def predict(self, images):
         """
-        重构图像
+        预测图像类别
         
         Args:
-            images: 输入图像 [B, C, H, W]
-            
+            images: (B, C, H, W) tensor, 范围[0, 1]
+        
         Returns:
-            重构的图像 [B, C, H, W]
+            predictions: (B,) 预测类别
+            probs: (B, num_classes) 类别概率
+            x_recon: (B, C, H, W) 重构图像（用于可视化）
+            indices: (B, H, W) 码本索引（用于可视化）
         """
         images = images.to(self.device)
-        recon_images, _, _ = self.model(images)
+        images_normalized = images * 2 - 1
         
-        # VAE返回flatten的输出，需要reshape
-        if self.model_type == 'vae':
-            recon_images = recon_images.view(-1, 1, 28, 28)
+        # VQ-VAE处理
+        # 调用forward
+        x_recon, _, indices = self.vqvae(images_normalized)
+        x_recon = (x_recon + 1) / 2  # 反标准化到[0, 1]
         
-        return recon_images
-    
-    @torch.no_grad()
-    def encode(self, images: torch.Tensor) -> torch.Tensor:
-        """
-        编码到潜在空间（返回均值，不带随机性）
-        
-        Args:
-            images: 输入图像 [B, C, H, W]
-            
-        Returns:
-            潜在向量 [B, latent_dim]
-        """
-        images = images.to(self.device)
-        
-        # VAE需要flatten输入
-        if self.model_type == 'vae':
-            batch_size = images.size(0)
-            images = images.view(batch_size, -1)
-        
-        mu, _ = self.model.encode(images)
-        return mu
-    
-    @torch.no_grad()
-    def decode(self, latent_vectors: torch.Tensor) -> torch.Tensor:
-        """
-        从潜在空间解码
-        
-        Args:
-            latent_vectors: 潜在向量 [B, latent_dim]
-            
-        Returns:
-            解码的图像 [B, C, H, W]
-        """
-        latent_vectors = latent_vectors.to(self.device)
-        images = self.model.decode(latent_vectors)
-        
-        # ConvVAE和DeepConvVAE已经返回正确形状
-        # VAE需要reshape
-        if self.model_type == 'vae':
-            images = images.view(-1, 1, 28, 28)
-        
-        return images
-    
-    @torch.no_grad()
-    def generate(
-        self,
-        num_samples: int = 16,
-        temperature: float = 1.0
-    ) -> torch.Tensor:
-        """
-        随机生成新样本
-        
-        Args:
-            num_samples: 生成样本数量
-            temperature: 采样温度（控制多样性）
-                - temperature=1.0: 标准正态分布
-                - temperature>1.0: 更多样化
-                - temperature<1.0: 更确定性
-        
-        Returns:
-            生成的图像 [num_samples, C, H, W]
-        """
-        z = torch.randn(num_samples, self.latent_dim).to(self.device)
-        z = z * temperature
-        
-        images = self.decode(z)
-        return images
-    
-    @torch.no_grad()
-    def interpolate(
-        self,
-        image1: torch.Tensor,
-        image2: torch.Tensor,
-        num_steps: int = 10,
-        mode: str = 'linear'
-    ) -> torch.Tensor:
-        """
-        在两个图像之间进行潜在空间插值
-        
-        Args:
-            image1: 起始图像 [C, H, W] 或 [1, C, H, W]
-            image2: 终止图像 [C, H, W] 或 [1, C, H, W]
-            num_steps: 插值步数
-            mode: 插值模式
-                - 'linear': 线性插值（快速）
-                - 'spherical': 球面插值（更平滑，保持范数）
-        
-        Returns:
-            插值序列 [num_steps, C, H, W]
-        """
-        # 确保输入是4D [1, C, H, W]
-        if image1.dim() == 3:
-            image1 = image1.unsqueeze(0)
-        if image2.dim() == 3:
-            image2 = image2.unsqueeze(0)
-        
-        # 编码到潜在空间
-        z1 = self.encode(image1).squeeze(0)
-        z2 = self.encode(image2).squeeze(0)
-        
-        # 生成插值系数
-        alphas = torch.linspace(0, 1, num_steps).to(self.device)
-        
-        interpolations = []
-        for alpha in alphas:
-            if mode == 'linear':
-                # 线性插值: z = (1-α)z₁ + αz₂
-                z_interp = (1 - alpha) * z1 + alpha * z2
-                
-            elif mode == 'spherical':
-                # 球面线性插值 (SLERP)
-                # 保持向量范数，沿大圆弧插值
-                
-                # 计算夹角
-                dot_product = torch.dot(z1, z2)
-                norm_product = torch.norm(z1) * torch.norm(z2)
-                cos_omega = torch.clamp(dot_product / norm_product, -1, 1)
-                omega = torch.acos(cos_omega)
-                
-                # 如果向量几乎平行，回退到线性插值
-                if omega.abs() < 1e-6:
-                    z_interp = (1 - alpha) * z1 + alpha * z2
-                else:
-                    # SLERP公式: z = [sin((1-α)Ω)/sin(Ω)]z₁ + [sin(αΩ)/sin(Ω)]z₂
-                    sin_omega = torch.sin(omega)
-                    z_interp = (torch.sin((1 - alpha) * omega) / sin_omega) * z1 + \
-                               (torch.sin(alpha * omega) / sin_omega) * z2
-            else:
-                raise ValueError(f"Unknown interpolation mode: {mode}")
-            
-            # 解码
-            img = self.decode(z_interp.unsqueeze(0))
-            interpolations.append(img.squeeze(0))
-        
-        return torch.stack(interpolations)
-    
-    @torch.no_grad()
-    def latent_arithmetic(
-        self,
-        images: List[torch.Tensor],
-        operations: List[str]
-    ) -> torch.Tensor:
-        """
-        潜在空间算术运算
-        
-        示例: 生成 "数字风格迁移"
-        - images[0]: 源数字 (如 "3")
-        - images[1]: 风格参考 (如粗体的 "5")
-        - images[2]: 风格参考对照 (如正常的 "5")
-        - 操作: ['+', '-'] → z₀ + z₁ - z₂
-        
-        Args:
-            images: 图像列表 [N个 (C, H, W)]
-            operations: 操作符列表 [N-1个 '+' 或 '-']
-            
-        Returns:
-            结果图像 [C, H, W]
-        """
-        # 确保所有图像都是4D
-        images = [img.unsqueeze(0) if img.dim() == 3 else img for img in images]
-        
-        # 编码所有图像
-        latents = [self.encode(img).squeeze(0) for img in images]
-        
-        # 执行算术运算
-        result = latents[0]
-        for i, op in enumerate(operations):
-            if op == '+':
-                result = result + latents[i + 1]
-            elif op == '-':
-                result = result - latents[i + 1]
-            elif op == '*':
-                # 标量乘法
-                result = result * latents[i + 1]
-            else:
-                raise ValueError(f"Unknown operation: {op}")
-        
-        # 解码结果
-        return self.decode(result.unsqueeze(0)).squeeze(0)
-    
-    @torch.no_grad()
-    def explore_latent_dimensions(
-        self,
-        base_image: torch.Tensor,
-        dim_indices: List[int],
-        value_range: Tuple[float, float] = (-3, 3),
-        num_steps: int = 7
-    ) -> torch.Tensor:
-        """
-        探索特定潜在维度的影响
-        
-        固定其他维度，只改变指定维度的值，观察生成结果
-        
-        Args:
-            base_image: 基准图像 [C, H, W]
-            dim_indices: 要探索的维度索引列表
-            value_range: 值域范围 (min, max)
-            num_steps: 每个维度的采样步数
-            
-        Returns:
-            结果网格 [len(dim_indices) * num_steps, C, H, W]
-        """
-        if base_image.dim() == 3:
-            base_image = base_image.unsqueeze(0)
-        
-        # 获取基准潜在向量
-        z_base = self.encode(base_image).squeeze(0)
-        
-        # 生成采样值
-        values = torch.linspace(value_range[0], value_range[1], num_steps)
-        
-        results = []
-        for dim_idx in dim_indices:
-            for value in values:
-                z_modified = z_base.clone()
-                z_modified[dim_idx] = value
-                
-                img = self.decode(z_modified.unsqueeze(0))
-                results.append(img.squeeze(0))
-        
-        return torch.stack(results)
-    
-    @torch.no_grad()
-    def visualize_latent_space_2d(
-        self,
-        test_loader,
-        num_samples: int = 1000,
-        method: str = 'pca',
-        save_path: Optional[str] = None
-    ):
-        """
-        可视化潜在空间（降维到2D）
-        
-        Args:
-            test_loader: 测试数据加载器
-            num_samples: 使用的样本数
-            method: 降维方法 ('pca', 'tsne', 'umap')
-            save_path: 保存路径
-        """
-        latents = []
-        labels = []
-        
-        print(f"Collecting {num_samples} samples for visualization...")
-        for i, (images, lbls) in enumerate(tqdm(test_loader)):
-            if len(latents) * test_loader.batch_size >= num_samples:
-                break
-            
-            z = self.encode(images)
-            latents.append(z.cpu().numpy())
-            labels.append(lbls.numpy())
-        
-        latents = np.concatenate(latents, axis=0)[:num_samples]
-        labels = np.concatenate(labels, axis=0)[:num_samples]
-        
-        print(f"Performing {method.upper()} dimensionality reduction...")
-        
-        # 降维
-        if method == 'pca':
-            from sklearn.decomposition import PCA
-            reducer = PCA(n_components=2)
-            latents_2d = reducer.fit_transform(latents)
-            explained_var = reducer.explained_variance_ratio_
-            title = f'VAE Latent Space (PCA, {explained_var[0]:.1%}+{explained_var[1]:.1%} var)'
-            
-        elif method == 'tsne':
-            from sklearn.manifold import TSNE
-            reducer = TSNE(n_components=2, random_state=42)
-            latents_2d = reducer.fit_transform(latents)
-            title = 'VAE Latent Space (t-SNE)'
-            
-        elif method == 'umap':
-            try:
-                import umap
-                reducer = umap.UMAP(n_components=2, random_state=42)
-                latents_2d = reducer.fit_transform(latents)
-                title = 'VAE Latent Space (UMAP)'
-            except ImportError:
-                print("⚠ UMAP not installed, falling back to PCA")
-                from sklearn.decomposition import PCA
-                reducer = PCA(n_components=2)
-                latents_2d = reducer.fit_transform(latents)
-                title = 'VAE Latent Space (PCA)'
+        # 根据分类器类型选择输入
+        if self.classifier_type == 'discrete':
+            # 使用码本索引
+            classifier_input = indices
+        elif self.classifier_type == 'quantized':
+            # 使用量化向量
+            z_e = self.vqvae.encode(images_normalized)
+            z_q, _, _ = self.vqvae.quantize(z_e)
+            classifier_input = z_q
         else:
-            raise ValueError(f"Unknown method: {method}")
+            # 旧方案：使用重构图像（不推荐）
+            classifier_input = x_recon
         
-        # 可视化
-        plt.figure(figsize=(12, 10))
-        scatter = plt.scatter(
-            latents_2d[:, 0],
-            latents_2d[:, 1],
-            c=labels,
-            cmap='tab10',
-            alpha=0.6,
-            s=20,
-            edgecolors='none'
-        )
+        # 分类
+        logits = self.classifier(classifier_input)
+        probs = F.softmax(logits, dim=1)
+        predictions = logits.argmax(dim=1)
         
-        cbar = plt.colorbar(scatter, label='Digit', ticks=range(10))
-        cbar.set_label('Digit', fontsize=12)
+        return predictions, probs, x_recon, indices
+    
+    @torch.no_grad()
+    def evaluate(self, data_loader):
+        """
+        评估整个数据集
         
-        plt.xlabel('Component 1', fontsize=12)
-        plt.ylabel('Component 2', fontsize=12)
-        plt.title(title, fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3, linestyle='--')
+        Returns:
+            accuracy: 准确率
+            all_preds: 所有预测
+            all_labels: 所有标签
+        """
+        all_preds = []
+        all_labels = []
+        correct = 0
+        total = 0
+        
+        print("Evaluating...")
+        for images, labels in data_loader:
+            images = images.to(self.device)
+            labels = labels.to(self.device)
+            
+            predictions, _, _, _ = self.predict(images)
+            
+            all_preds.extend(predictions.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            
+            correct += (predictions == labels).sum().item()
+            total += labels.size(0)
+        
+        accuracy = 100.0 * correct / total
+        
+        return accuracy, np.array(all_preds), np.array(all_labels)
+    
+    def plot_confusion_matrix(self, data_loader, save_path=None):
+        """绘制混淆矩阵"""
+        _, preds, labels = self.evaluate(data_loader)
+        
+        cm = confusion_matrix(labels, preds)
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', 
+                    xticklabels=range(10), yticklabels=range(10))
+        plt.xlabel('Predicted Label')
+        plt.ylabel('True Label')
+        plt.title(f'Confusion Matrix (Classifier: {self.classifier_type})')
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Confusion matrix saved to {save_path}")
+        plt.show()
+    
+    def print_classification_report(self, data_loader):
+        """打印分类报告"""
+        _, preds, labels = self.evaluate(data_loader)
+        
+        print("\n" + "="*60)
+        print(f"Classification Report (Classifier: {self.classifier_type})")
+        print("="*60)
+        print(classification_report(labels, preds, 
+                                    target_names=[str(i) for i in range(10)]))
+    
+    def visualize_predictions(self, data_loader, num_samples=20, save_path=None):
+        """可视化预测结果"""
+        # 获取数据
+        images_list = []
+        labels_list = []
+        
+        for images, labels in data_loader:
+            images_list.append(images)
+            labels_list.append(labels)
+            if len(images_list) * images.size(0) >= num_samples:
+                break
+        
+        images = torch.cat(images_list)[:num_samples]
+        labels = torch.cat(labels_list)[:num_samples]
+        
+        # 预测
+        predictions, probs, x_recon, indices = self.predict(images)
+        
+        # 绘制
+        cols = 5
+        rows = (num_samples + cols - 1) // cols
+        
+        # 根据分类器类型决定显示内容
+        if self.classifier_type == 'discrete':
+            # 显示：原图、重构图、码本索引分布、预测
+            fig = plt.figure(figsize=(cols * 2, rows * 8))
+            gs = fig.add_gridspec(rows * 4, cols, hspace=0.3, wspace=0.2)
+            
+            for i in range(num_samples):
+                row = i // cols
+                col = i % cols
+                
+                # 原图
+                ax0 = fig.add_subplot(gs[row * 4, col])
+                ax0.imshow(images[i, 0], cmap='gray')
+                ax0.axis('off')
+                if col == 0:
+                    ax0.set_ylabel('Original', fontsize=10, rotation=0, ha='right', va='center')
+                true_label = labels[i].item()
+                ax0.set_title(f'Label: {true_label}', fontsize=9)
+                
+                # 重构图像
+                ax1 = fig.add_subplot(gs[row * 4 + 1, col])
+                ax1.imshow(x_recon[i, 0].cpu(), cmap='gray')
+                ax1.axis('off')
+                if col == 0:
+                    ax1.set_ylabel('Recon', fontsize=10, rotation=0, ha='right', va='center')
+                
+                # 码本索引分布
+                ax2 = fig.add_subplot(gs[row * 4 + 2, col])
+                idx_flat = indices[i].cpu().flatten().numpy()
+                ax2.hist(idx_flat, bins=30, color='steelblue', alpha=0.7, edgecolor='black')
+                ax2.set_xlim(0, 512)
+                ax2.tick_params(labelsize=6)
+                ax2.set_ylabel('Count', fontsize=8)
+                if col == 0:
+                    ax2.set_ylabel('Code Dist', fontsize=10, rotation=0, ha='right', va='center')
+                
+                # 预测结果
+                ax3 = fig.add_subplot(gs[row * 4 + 3, col])
+                ax3.axis('off')
+                pred_label = predictions[i].item()
+                confidence = probs[i, pred_label].item() * 100
+                color = 'green' if pred_label == true_label else 'red'
+                text = f'Pred: {pred_label}\nConf: {confidence:.1f}%'
+                ax3.text(0.5, 0.5, text, ha='center', va='center', 
+                        fontsize=10, color=color, weight='bold')
+        else:
+            # 简化版：原图、重构图、预测
+            fig, axes = plt.subplots(rows * 3, cols, figsize=(cols * 2, rows * 6))
+            axes = axes.flatten()
+            
+            for i in range(num_samples):
+                # 原图
+                ax_img = axes[i * 3]
+                ax_img.imshow(images[i, 0], cmap='gray')
+                ax_img.axis('off')
+                true_label = labels[i].item()
+                ax_img.set_title(f'Original: {true_label}', fontsize=8)
+                
+                # 重构图像
+                ax_recon = axes[i * 3 + 1]
+                ax_recon.imshow(x_recon[i, 0].cpu(), cmap='gray')
+                ax_recon.axis('off')
+                ax_recon.set_title('Reconstructed', fontsize=8)
+                
+                # 预测结果
+                ax_pred = axes[i * 3 + 2]
+                ax_pred.axis('off')
+                pred_label = predictions[i].item()
+                confidence = probs[i, pred_label].item() * 100
+                color = 'green' if pred_label == true_label else 'red'
+                text = f'Pred: {pred_label}\nConf: {confidence:.1f}%'
+                ax_pred.text(0.5, 0.5, text, ha='center', va='center', 
+                            fontsize=10, color=color, weight='bold')
+            
+            # 隐藏多余的子图
+            for i in range(num_samples * 3, len(axes)):
+                axes[i].axis('off')
+        
+        plt.suptitle(f'Predictions (Classifier: {self.classifier_type})', fontsize=14)
         plt.tight_layout()
         
         if save_path:
-            plt.savefig(save_path, dpi=300, bbox_inches='tight')
-            print(f"✓ Latent space visualization saved to {save_path}")
-        
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Predictions saved to {save_path}")
         plt.show()
     
-    @torch.no_grad()
-    def get_reconstruction_error(
-        self,
-        test_loader,
-        num_batches: int = 10
-    ) -> Tuple[float, np.ndarray]:
-        """
-        计算重构误差统计
+    def visualize_hard_examples(self, data_loader, num_samples=10, save_path=None):
+        """可视化最难分类的样本（低置信度）"""
+        all_images = []
+        all_labels = []
+        all_probs = []
+        all_preds = []
+        all_recons = []
+        all_indices = []
         
-        Returns:
-            mean_error: 平均重构误差
-            per_sample_errors: 每个样本的误差 [N]
-        """
-        errors = []
-        
-        print("Computing reconstruction errors...")
-        for i, (images, _) in enumerate(tqdm(test_loader)):
-            if i >= num_batches:
-                break
+        # 收集所有样本
+        for images, labels in data_loader:
+            predictions, probs, x_recon, indices = self.predict(images)
             
+            all_images.append(images)
+            all_labels.append(labels)
+            all_probs.append(probs.cpu())
+            all_preds.append(predictions.cpu())
+            all_recons.append(x_recon.cpu())
+            all_indices.append(indices.cpu())
+        
+        all_images = torch.cat(all_images)
+        all_labels = torch.cat(all_labels)
+        all_probs = torch.cat(all_probs)
+        all_preds = torch.cat(all_preds)
+        all_recons = torch.cat(all_recons)
+        all_indices = torch.cat(all_indices)
+        
+        # 找到置信度最低的样本
+        max_probs = all_probs.max(dim=1)[0]
+        hard_indices = max_probs.argsort()[:num_samples]
+        
+        # 绘制
+        if self.classifier_type == 'discrete':
+            fig, axes = plt.subplots(4, num_samples, figsize=(num_samples * 2, 8))
+            
+            for i, idx in enumerate(hard_indices):
+                # 原图
+                axes[0, i].imshow(all_images[idx, 0], cmap='gray')
+                axes[0, i].axis('off')
+                if i == 0:
+                    axes[0, i].set_ylabel('Original', fontsize=10)
+                true_label = all_labels[idx].item()
+                axes[0, i].set_title(f'Label: {true_label}', fontsize=8)
+                
+                # 重构图像
+                axes[1, i].imshow(all_recons[idx, 0], cmap='gray')
+                axes[1, i].axis('off')
+                if i == 0:
+                    axes[1, i].set_ylabel('Recon', fontsize=10)
+                
+                # 码本索引分布
+                idx_flat = all_indices[idx].flatten().numpy()
+                axes[2, i].hist(idx_flat, bins=20, color='coral', alpha=0.7)
+                axes[2, i].tick_params(labelsize=6)
+                if i == 0:
+                    axes[2, i].set_ylabel('Codes', fontsize=10)
+                
+                # 预测
+                pred_label = all_preds[idx].item()
+                confidence = max_probs[idx].item() * 100
+                axes[3, i].axis('off')
+                color = 'green' if pred_label == true_label else 'red'
+                axes[3, i].text(0.5, 0.5, f'Pred: {pred_label}\n{confidence:.1f}%', 
+                               ha='center', va='center', fontsize=10, color=color, weight='bold')
+        else:
+            fig, axes = plt.subplots(3, num_samples, figsize=(num_samples * 2, 6))
+            
+            for i, idx in enumerate(hard_indices):
+                # 原图
+                axes[0, i].imshow(all_images[idx, 0], cmap='gray')
+                axes[0, i].axis('off')
+                if i == 0:
+                    axes[0, i].set_ylabel('Original', fontsize=10)
+                true_label = all_labels[idx].item()
+                axes[0, i].set_title(f'Label: {true_label}', fontsize=8)
+                
+                # 重构图像
+                axes[1, i].imshow(all_recons[idx, 0], cmap='gray')
+                axes[1, i].axis('off')
+                if i == 0:
+                    axes[1, i].set_ylabel('Reconstructed', fontsize=10)
+                
+                # 预测
+                pred_label = all_preds[idx].item()
+                confidence = max_probs[idx].item() * 100
+                axes[2, i].axis('off')
+                color = 'green' if pred_label == true_label else 'red'
+                axes[2, i].text(0.5, 0.5, f'Pred: {pred_label}\n{confidence:.1f}%', 
+                               ha='center', va='center', fontsize=10, color=color, weight='bold')
+        
+        plt.suptitle(f'Hardest Examples (Classifier: {self.classifier_type})', fontsize=14)
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Hard examples saved to {save_path}")
+        plt.show()
+    
+    def visualize_code_usage(self, data_loader, save_path=None):
+        """可视化码本使用情况（仅适用于discrete类型）"""
+        if self.classifier_type != 'discrete':
+            print("Code usage visualization only available for 'discrete' classifier")
+            return
+        
+        all_indices = []
+        
+        print("Collecting code usage statistics...")
+        for images, _ in data_loader:
             images = images.to(self.device)
-            recon = self.reconstruct(images)
+            images_normalized = images * 2 - 1
             
-            # 计算每个样本的MSE
-            batch_errors = torch.mean(
-                (images - recon) ** 2,
-                dim=(1, 2, 3)
-            ).cpu().numpy()
-            
-            errors.extend(batch_errors)
+            indices = self.vqvae.get_code_indices(images_normalized)
+            all_indices.append(indices.cpu().flatten())
         
-        errors = np.array(errors)
-        return errors.mean(), errors
+        all_indices = torch.cat(all_indices).numpy()
+        
+        # 可视化
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # 直方图
+        axes[0].hist(all_indices, bins=50, color='steelblue', alpha=0.7, edgecolor='black')
+        axes[0].set_xlabel('Codebook Index')
+        axes[0].set_ylabel('Frequency')
+        axes[0].set_title('Codebook Usage Distribution')
+        axes[0].grid(True, alpha=0.3)
+        
+        # 排序后的使用频率
+        unique, counts = np.unique(all_indices, return_counts=True)
+        sorted_counts = sorted(counts, reverse=True)
+        
+        axes[1].bar(range(len(unique)), sorted_counts, color='coral', alpha=0.7)
+        axes[1].set_xlabel('Code Rank (sorted by frequency)')
+        axes[1].set_ylabel('Usage Count')
+        axes[1].set_title('Codebook Usage (Sorted)')
+        axes[1].grid(True, alpha=0.3)
+        
+        # 统计信息
+        usage_ratio = len(unique) / 512
+        textstr = f'Used codes: {len(unique)}/512 ({usage_ratio*100:.1f}%)\n'
+        textstr += f'Most used: {counts.max()} times\n'
+        textstr += f'Least used: {counts.min()} times'
+        
+        axes[1].text(0.98, 0.98, textstr, transform=axes[1].transAxes,
+                    fontsize=10, verticalalignment='top', horizontalalignment='right',
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"✓ Code usage saved to {save_path}")
+        plt.show()
+        
+        print(f"\nCode usage statistics:")
+        print(f"  Used codes: {len(unique)}/512 ({usage_ratio*100:.1f}%)")
+        print(f"  Most used code: {counts.max()} times")
+        print(f"  Least used code: {counts.min()} times")
+    
+    def process_single_image(self, image_path, save_path=None):
+        """处理单张图像"""
+        from PIL import Image
+        
+        # 读取并预处理
+        img = Image.open(image_path).convert('L')
+        img = img.resize((28, 28))
+        
+        transform = transforms.ToTensor()
+        img_tensor = transform(img).unsqueeze(0)
+        
+        # 预测
+        prediction, probs, x_recon, indices = self.predict(img_tensor)
+        
+        # 可视化
+        if self.classifier_type == 'discrete':
+            fig, axes = plt.subplots(1, 5, figsize=(20, 4))
+            
+            # 原图
+            axes[0].imshow(img_tensor[0, 0], cmap='gray')
+            axes[0].set_title('Input Image')
+            axes[0].axis('off')
+            
+            # 重构图像
+            axes[1].imshow(x_recon[0, 0].cpu(), cmap='gray')
+            axes[1].set_title('Reconstructed')
+            axes[1].axis('off')
+            
+            # 差异图
+            diff = torch.abs(img_tensor[0, 0] - x_recon[0, 0].cpu())
+            axes[2].imshow(diff, cmap='hot')
+            axes[2].set_title('Absolute Difference')
+            axes[2].axis('off')
+            
+            # 码本索引分布
+            idx_flat = indices[0].cpu().flatten().numpy()
+            axes[3].hist(idx_flat, bins=20, color='steelblue', alpha=0.7, edgecolor='black')
+            axes[3].set_xlabel('Code Index')
+            axes[3].set_ylabel('Count')
+            axes[3].set_title('Code Distribution')
+            axes[3].grid(True, alpha=0.3)
+            
+            # 预测概率
+            axes[4].bar(range(10), probs[0].cpu().numpy())
+            axes[4].set_xlabel('Digit')
+            axes[4].set_ylabel('Probability')
+            axes[4].set_title(f'Prediction: {prediction.item()}')
+            axes[4].grid(True, alpha=0.3)
+        else:
+            fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+            
+            # 原图
+            axes[0].imshow(img_tensor[0, 0], cmap='gray')
+            axes[0].set_title('Input Image')
+            axes[0].axis('off')
+            
+            # 重构图像
+            axes[1].imshow(x_recon[0, 0].cpu(), cmap='gray')
+            axes[1].set_title('Reconstructed')
+            axes[1].axis('off')
+            
+            # 差异图
+            diff = torch.abs(img_tensor[0, 0] - x_recon[0, 0].cpu())
+            axes[2].imshow(diff, cmap='hot')
+            axes[2].set_title('Absolute Difference')
+            axes[2].axis('off')
+            
+            # 预测概率
+            axes[3].bar(range(10), probs[0].cpu().numpy())
+            axes[3].set_xlabel('Digit')
+            axes[3].set_ylabel('Probability')
+            axes[3].set_title(f'Prediction: {prediction.item()}')
+            axes[3].grid(True, alpha=0.3)
+        
+        plt.tight_layout()
+        
+        if save_path:
+            plt.savefig(save_path, dpi=150)
+            print(f"✓ Saved to {save_path}")
+        plt.show()
+        
+        return prediction.item(), probs[0].cpu().numpy()
 
 
-def visualize_reconstruction(
-    inference: VAEInference,
-    images: torch.Tensor,
-    save_path: Optional[str] = None,
-    title: str = 'Image Reconstruction'
-):
-    """可视化重构结果"""
-    recon_images = inference.reconstruct(images)
+def demo_evaluation():
+    """演示评估功能"""
+    print("="*60)
+    print("Demo: Model Evaluation")
+    print("="*60)
     
-    # 拼接原图和重构图
-    num_images = min(8, len(images))
-    comparison = torch.cat([
-        images[:num_images].cpu(),
-        recon_images[:num_images].cpu()
-    ])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 创建网格
-    grid = torchvision.utils.make_grid(
-        comparison,
-        nrow=num_images,
-        normalize=True,
-        padding=2,
-        pad_value=1
+    # 加载模型
+    from model import DeepConvVQVAE
+    from train import DiscreteCodeClassifier
+    
+    vqvae = DeepConvVQVAE(
+        in_channels=1,
+        image_size=28,
+        hidden_channels=[32, 64],
+        embedding_dim=64,
+        num_embeddings=512,
+        num_res_blocks=2
     )
     
-    # 显示
-    plt.figure(figsize=(16, 4.5))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-    plt.axis('off')
-    plt.title(f'{title}\nTop: Original | Bottom: Reconstructed', 
-              fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Reconstruction saved to {save_path}")
-    
-    plt.show()
-
-
-def visualize_generation(
-    inference: VAEInference,
-    num_samples: int = 16,
-    temperature: float = 1.0,
-    save_path: Optional[str] = None
-):
-    """可视化随机生成"""
-    samples = inference.generate(num_samples, temperature=temperature)
-    
-    grid = torchvision.utils.make_grid(
-        samples.cpu(),
-        nrow=4,
-        normalize=True,
-        padding=2,
-        pad_value=1
+    classifier = DiscreteCodeClassifier(
+        num_embeddings=512,
+        embedding_dim=64,
+        spatial_size=7,
+        num_classes=10
     )
     
-    plt.figure(figsize=(10, 10))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-    plt.axis('off')
-    plt.title(f'Random Samples (temperature={temperature:.1f})',
-              fontsize=14, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Generated samples saved to {save_path}")
-    
-    plt.show()
-
-
-def visualize_interpolation(
-    inference: VAEInference,
-    image1: torch.Tensor,
-    image2: torch.Tensor,
-    num_steps: int = 10,
-    save_path: Optional[str] = None
-):
-    """可视化插值 - 同时展示线性和球面插值"""
-    # 线性插值
-    linear_interp = inference.interpolate(image1, image2, num_steps, mode='linear')
-    
-    # 球面插值
-    spherical_interp = inference.interpolate(image1, image2, num_steps, mode='spherical')
-    
-    # 拼接
-    comparison = torch.cat([linear_interp.cpu(), spherical_interp.cpu()])
-    
-    grid = torchvision.utils.make_grid(
-        comparison,
-        nrow=num_steps,
-        normalize=True,
-        padding=2,
-        pad_value=1
+    inferencer = ClassificationInference(
+        vqvae_model=vqvae,
+        classifier_model=classifier,
+        device=device,
+        classifier_type='discrete',
+        checkpoint_path="checkpoints/classifier_epoch_30.pt"
     )
-    
-    plt.figure(figsize=(18, 5))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-    plt.axis('off')
-    plt.title('Latent Space Interpolation\nTop: Linear | Bottom: Spherical (SLERP)',
-              fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Interpolation saved to {save_path}")
-    
-    plt.show()
-
-
-def visualize_latent_exploration(
-    inference: VAEInference,
-    image: torch.Tensor,
-    num_dims: int = 5,
-    save_path: Optional[str] = None
-):
-    """可视化潜在维度探索"""
-    # 选择前num_dims个维度
-    dim_indices = list(range(num_dims))
-    
-    results = inference.explore_latent_dimensions(
-        image,
-        dim_indices=dim_indices,
-        value_range=(-3, 3),
-        num_steps=7
-    )
-    
-    grid = torchvision.utils.make_grid(
-        results.cpu(),
-        nrow=7,
-        normalize=True,
-        padding=2,
-        pad_value=1
-    )
-    
-    plt.figure(figsize=(16, 2.5 * num_dims))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-    plt.axis('off')
-    plt.title(f'Latent Dimension Exploration (dims {dim_indices})\n'
-              f'Each row shows variation in one dimension from -3 to +3',
-              fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Latent exploration saved to {save_path}")
-    
-    plt.show()
-
-
-def visualize_temperature_sampling(
-    inference: VAEInference,
-    temperatures: List[float] = [0.5, 0.8, 1.0, 1.2, 1.5],
-    num_samples_per_temp: int = 8,
-    save_path: Optional[str] = None
-):
-    """可视化不同温度下的采样"""
-    all_samples = []
-    
-    for temp in temperatures:
-        samples = inference.generate(num_samples_per_temp, temperature=temp)
-        all_samples.append(samples)
-    
-    # 拼接所有样本
-    all_samples = torch.cat(all_samples, dim=0)
-    
-    grid = torchvision.utils.make_grid(
-        all_samples.cpu(),
-        nrow=num_samples_per_temp,
-        normalize=True,
-        padding=2,
-        pad_value=1
-    )
-    
-    plt.figure(figsize=(18, 2.5 * len(temperatures)))
-    plt.imshow(grid.permute(1, 2, 0).cpu().numpy(), cmap='gray')
-    plt.axis('off')
-    
-    # 添加温度标签
-    title = 'Temperature Effect on Sampling Diversity\n'
-    title += ' | '.join([f'T={t:.1f}' for t in temperatures])
-    plt.title(title, fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        print(f"✓ Temperature comparison saved to {save_path}")
-    
-    plt.show()
-
-
-def main():
-    parser = argparse.ArgumentParser(
-        description='VAE Inference - Optimized',
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # 运行所有可视化
-  python infer_vae_optimized.py --checkpoint ./checkpoints/best.pt
-  
-  # 只生成样本
-  python infer_vae_optimized.py --checkpoint ./checkpoints/best.pt --mode generate
-  
-  # 探索潜在空间
-  python infer_vae_optimized.py --checkpoint ./checkpoints/best.pt --mode latent --vis-method tsne
-        """
-    )
-    
-    parser.add_argument('--checkpoint', type=str, required=True, 
-                       help='模型检查点路径')
-    parser.add_argument('--mode', type=str, default='all',
-                       choices=['reconstruct', 'generate', 'interpolate', 
-                               'latent', 'explore', 'temperature', 'all'],
-                       help='推理模式')
-    parser.add_argument('--num-samples', type=int, default=16, 
-                       help='生成样本数量')
-    parser.add_argument('--temperature', type=float, default=1.0,
-                       help='生成温度')
-    parser.add_argument('--vis-method', type=str, default='pca',
-                       choices=['pca', 'tsne', 'umap'],
-                       help='潜在空间可视化方法')
-    parser.add_argument('--output-dir', type=str, default='./inference_outputs', 
-                       help='输出目录')
-    parser.add_argument('--device', type=str, default='cuda', 
-                       help='设备')
-    
-    args = parser.parse_args()
-    
-    # 创建输出目录
-    output_dir = Path(args.output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Output directory: {output_dir}")
-    
-    # 创建推理器
-    print("\n" + "="*60)
-    inference = VAEInference(args.checkpoint, args.device)
-    print("="*60 + "\n")
     
     # 加载测试数据
     transform = transforms.ToTensor()
-    test_dataset = torchvision.datasets.MNIST(
-        root='./data',
-        train=False,
-        download=True,
-        transform=transform
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    
+    # 评估
+    accuracy, _, _ = inferencer.evaluate(test_loader)
+    print(f"\nTest Accuracy: {accuracy:.2f}%")
+    
+    # 分类报告
+    inferencer.print_classification_report(test_loader)
+    
+    # 混淆矩阵
+    inferencer.plot_confusion_matrix(test_loader, save_path="results/confusion_matrix.png")
+
+
+def demo_visualizations():
+    """演示可视化功能"""
+    print("\n" + "="*60)
+    print("Demo: Visualizations")
+    print("="*60)
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    # 加载模型
+    from model import DeepConvVQVAE
+    from train import DiscreteCodeClassifier
+    
+    vqvae = DeepConvVQVAE(
+        in_channels=1,
+        image_size=28,
+        hidden_channels=[32, 64],
+        embedding_dim=64,
+        num_embeddings=512,
+        num_res_blocks=2
     )
-    test_loader = torch.utils.data.DataLoader(
-        test_dataset,
-        batch_size=128,
-        shuffle=True,
-        num_workers=2
+    
+    classifier = DiscreteCodeClassifier(
+        num_embeddings=512,
+        embedding_dim=64,
+        spatial_size=7,
+        num_classes=10
     )
     
-    # 获取测试图像
-    test_images, test_labels = next(iter(test_loader))
+    inferencer = ClassificationInference(
+        vqvae_model=vqvae,
+        classifier_model=classifier,
+        device=device,
+        classifier_type='discrete',
+        checkpoint_path="checkpoints/classifier_epoch_30.pt"
+    )
     
-    # 执行推理
-    if args.mode in ['reconstruct', 'all']:
-        print("\n" + "="*60)
-        print("RECONSTRUCTION")
-        print("="*60)
-        visualize_reconstruction(
-            inference,
-            test_images[:16],
-            save_path=output_dir / 'reconstruction.png'
-        )
+    # 加载测试数据
+    transform = transforms.ToTensor()
+    test_dataset = datasets.MNIST(root='./data', train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
     
-    if args.mode in ['generate', 'all']:
-        print("\n" + "="*60)
-        print("GENERATION")
-        print("="*60)
-        visualize_generation(
-            inference,
-            num_samples=args.num_samples,
-            temperature=args.temperature,
-            save_path=output_dir / 'generation.png'
-        )
+    # 1. 预测可视化
+    inferencer.visualize_predictions(test_loader, num_samples=20, 
+                                    save_path="results/predictions.png")
     
-    if args.mode in ['interpolate', 'all']:
-        print("\n" + "="*60)
-        print("INTERPOLATION")
-        print("="*60)
-        visualize_interpolation(
-            inference,
-            test_images[0],
-            test_images[1],
-            num_steps=10,
-            save_path=output_dir / 'interpolation.png'
-        )
+    # 2. 困难样本
+    inferencer.visualize_hard_examples(test_loader, num_samples=10,
+                                      save_path="results/hard_examples.png")
     
-    if args.mode in ['explore', 'all']:
-        print("\n" + "="*60)
-        print("LATENT DIMENSION EXPLORATION")
-        print("="*60)
-        visualize_latent_exploration(
-            inference,
-            test_images[0],
-            num_dims=5,
-            save_path=output_dir / 'latent_exploration.png'
-        )
+    # 3. 码本使用情况（仅discrete模式）
+    inferencer.visualize_code_usage(test_loader, 
+                                   save_path="results/code_usage.png")
+
+
+def main():
+    """运行所有演示"""
+    Path("results").mkdir(exist_ok=True)
     
-    if args.mode in ['temperature', 'all']:
-        print("\n" + "="*60)
-        print("TEMPERATURE SAMPLING")
-        print("="*60)
-        visualize_temperature_sampling(
-            inference,
-            temperatures=[0.5, 0.8, 1.0, 1.2, 1.5],
-            save_path=output_dir / 'temperature_sampling.png'
-        )
+    try:
+        demo_evaluation()
+    except Exception as e:
+        print(f"Evaluation demo failed: {e}")
+        import traceback
+        traceback.print_exc()
     
-    if args.mode in ['latent', 'all']:
-        print("\n" + "="*60)
-        print("LATENT SPACE VISUALIZATION")
-        print("="*60)
-        inference.visualize_latent_space_2d(
-            test_loader,
-            num_samples=1000,
-            method=args.vis_method,
-            save_path=output_dir / f'latent_space_{args.vis_method}.png'
-        )
-    
-    # 计算重构误差
-    if args.mode == 'all':
-        print("\n" + "="*60)
-        print("RECONSTRUCTION ERROR ANALYSIS")
-        print("="*60)
-        mean_error, errors = inference.get_reconstruction_error(test_loader, num_batches=50)
-        print(f"Mean reconstruction error (MSE): {mean_error:.6f}")
-        print(f"Std: {errors.std():.6f}")
-        print(f"Min: {errors.min():.6f}")
-        print(f"Max: {errors.max():.6f}")
-        
-        # 可视化误差分布
-        plt.figure(figsize=(10, 6))
-        plt.hist(errors, bins=50, alpha=0.7, edgecolor='black')
-        plt.xlabel('Reconstruction Error (MSE)', fontsize=12)
-        plt.ylabel('Count', fontsize=12)
-        plt.title('Distribution of Reconstruction Errors', fontsize=14, fontweight='bold')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.savefig(output_dir / 'error_distribution.png', dpi=300, bbox_inches='tight')
-        print(f"✓ Error distribution saved to {output_dir / 'error_distribution.png'}")
-        plt.show()
+    try:
+        demo_visualizations()
+    except Exception as e:
+        print(f"Visualization demo failed: {e}")
+        import traceback
+        traceback.print_exc()
     
     print("\n" + "="*60)
-    print(f"✓ All outputs saved to {output_dir}")
+    print("All demos completed!")
     print("="*60)
 
-# python inference.py --checkpoint ./checkpoints/best.pt
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
