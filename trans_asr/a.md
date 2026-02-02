@@ -137,3 +137,5 @@ Target Text Tokens (训练时)
 │      ↓                                                       │
 │  最终文本序列                                                 │
 └──────────────────────────────────────────────────────────────┘
+
+LRS2 dataset: https://aistudio.baidu.com/datasetdetail/228857
