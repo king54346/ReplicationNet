@@ -1,375 +1,262 @@
 """
-Pure CTC Model - 只包含CTC，不含Attention Decoder
+CTC Inference Script - Enhanced
+支持单个文件和批量推理
 """
+import os
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import math
-
-
-class SpecAugment(nn.Module):
-    def __init__(self, freq_mask=27, time_mask=100):
-        super().__init__()
-        self.freq_mask = freq_mask
-        self.time_mask = time_mask
-
-    def forward(self, x):
-        if not self.training:
-            return x
-
-        batch, time, freq = x.shape
-        x = x.clone()
-
-        # Frequency masking
-        if torch.rand(1).item() < 0.15:
-            for _ in range(2):
-                f = torch.randint(0, self.freq_mask + 1, (1,)).item()
-                f0 = torch.randint(0, freq - f + 1, (1,)).item()
-                x[:, :, f0:f0 + f] = 0
-
-        # Time masking
-        if torch.rand(1).item() < 0.15:
-            for _ in range(2):
-                t = torch.randint(0, min(self.time_mask + 1, time // 5), (1,)).item()
-                t0 = torch.randint(0, time - t + 1, (1,)).item()
-                x[:, t0:t0 + t, :] = 0
-
-        return x
-
-
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, dropout=0.1, max_len=5000):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        pe = pe.unsqueeze(0)
-
-        self.register_buffer('pe', pe)
-
-    def forward(self, x):
-        x = x + self.pe[:, :x.size(1), :]
-        return self.dropout(x)
-
-
-class CNNSubsampling(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout=0.1):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1)
-        self.conv2 = nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-        self.dropout = nn.Dropout(p=dropout)
-        self.linear = nn.Linear(64 * (in_channels // 4), out_channels)
-        self.layer_norm = nn.LayerNorm(out_channels)
-
-    def forward(self, x):
-        # (B, T, F) -> (B, 1, T, F)
-        x = x.unsqueeze(1)
-        x = torch.relu(self.conv1(x))
-        x = self.dropout(x)
-        x = torch.relu(self.conv2(x))
-        x = self.dropout(x)
-
-        # Reshape
-        b, c, t, f = x.size()
-        x = x.permute(0, 2, 1, 3).contiguous().view(b, t, c * f)
-
-        x = self.linear(x)
-        x = self.layer_norm(x)
-        return x
-
-
-class CTCASR(nn.Module):
-    """纯CTC语音识别模型"""
-
-    def __init__(
-            self,
-            n_mels=80,
-            d_model=512,
-            nhead=8,
-            num_encoder_layers=12,
-            dim_feedforward=2048,
-            dropout=0.3,
-            vocab_size=30,
-            blank_id=0,
-            use_cnn_subsampling=True,
-            use_spec_augment=True
-    ):
-        super().__init__()
-
-        self.d_model = d_model
-        self.vocab_size = vocab_size
-        self.blank_id = blank_id
-
-        # SpecAugment
-        self.spec_augment = SpecAugment() if use_spec_augment else None
-
-        # Feature extraction
-        if use_cnn_subsampling:
-            self.feature_extractor = CNNSubsampling(n_mels, d_model, dropout)
-            self.subsampling_factor = 4
-        else:
-            self.feature_extractor = nn.Sequential(
-                nn.Linear(n_mels, d_model),
-                nn.LayerNorm(d_model),
-                nn.Dropout(dropout)
-            )
-            self.subsampling_factor = 1
-
-        # Positional encoding
-        self.pos_encoder = PositionalEncoding(d_model, dropout)
-
-        # Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout,
-            activation='gelu', batch_first=True, norm_first=True
-        )
-        self.encoder = nn.TransformerEncoder(
-            encoder_layer, num_encoder_layers, nn.LayerNorm(d_model)
-        )
-
-        # CTC output layer
-        self.ctc_output = nn.Linear(d_model, vocab_size)
-
-        # CTC loss
-        self.ctc_loss = nn.CTCLoss(blank=blank_id, reduction='mean', zero_infinity=True)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for name, p in self.named_parameters():
-            if p.dim() > 1:
-                if 'ctc_output' in name:
-                    nn.init.normal_(p, mean=0, std=self.d_model ** -0.5)
-                else:
-                    nn.init.xavier_uniform_(p)
-
-    def _create_audio_mask(self, src):
-        """检测全为0的时间步 -> True=padding"""
-        return (src.abs().sum(dim=-1) == 0)
-
-    def _adjust_mask_for_subsampling(self, mask, new_length):
-        """调整mask以匹配subsampling后的长度"""
-        if mask is None:
-            return None
-
-        b, old_len = mask.size()
-        mask_4d = mask.view(b, 1, 1, old_len).float()
-        pooled = F.max_pool2d(mask_4d, kernel_size=(1, self.subsampling_factor),
-                              stride=(1, self.subsampling_factor))
-        adjusted = pooled.view(b, -1).bool()
-
-        # 调整到目标长度
-        curr_len = adjusted.size(1)
-        if curr_len < new_length:
-            adjusted = torch.cat([
-                adjusted,
-                torch.zeros(b, new_length - curr_len, dtype=torch.bool, device=adjusted.device)
-            ], dim=1)
-        elif curr_len > new_length:
-            adjusted = adjusted[:, :new_length]
-
-        return adjusted
-
-    def forward(self, src, src_lengths=None):
-        """
-        前向传播
-        Args:
-            src: (B, T, n_mels) - 音频特征，padding=0
-            src_lengths: (B,) - 实际长度（可选）
-        Returns:
-            log_probs: (B, T', vocab_size) - log概率
-            output_lengths: (B,) - 编码后的实际长度
-        """
-        # 自动创建mask
-        src_mask = self._create_audio_mask(src)
-
-        # SpecAugment
-        if self.training and self.spec_augment is not None:
-            src = self.spec_augment(src)
-
-        # Feature extraction
-        src = self.feature_extractor(src)
-        src = self.pos_encoder(src)
-
-        # 调整mask
-        if src_mask is not None and self.subsampling_factor > 1:
-            src_mask = self._adjust_mask_for_subsampling(src_mask, src.size(1))
-
-        # Encode
-        memory = self.encoder(src, src_key_padding_mask=src_mask)
-
-        # CTC output
-        logits = self.ctc_output(memory)  # (B, T', vocab_size)
-        log_probs = F.log_softmax(logits, dim=-1)
-
-        # 计算输出长度
-        if src_lengths is not None:
-            output_lengths = (src_lengths / self.subsampling_factor).long()
-        else:
-            # 从mask推断长度
-            if src_mask is not None:
-                valid_lengths = (~src_mask).sum(dim=1)
-                output_lengths = (valid_lengths / self.subsampling_factor).long()
-            else:
-                output_lengths = torch.full((src.size(0),), memory.size(1),
-                                            dtype=torch.long, device=src.device)
-
-        return log_probs, output_lengths
-
-    def decode_greedy(self, src, src_lengths=None):
-        """
-        贪婪解码
-        Args:
-            src: (B, T, n_mels)
-            src_lengths: (B,) - 实际长度
-        Returns:
-            decoded: List[List[int]] - 解码结果
-        """
-        log_probs, output_lengths = self.forward(src, src_lengths)
-
-        # 取每帧最大概率的token
-        best_paths = torch.argmax(log_probs, dim=-1)  # (B, T')
-
-        decoded = []
-        for i in range(best_paths.size(0)):
-            length = output_lengths[i].item()
-            path = best_paths[i, :length].tolist()
-
-            # 去除blank和重复
-            decoded_seq = []
-            prev = None
-            for token in path:
-                if token != self.blank_id and token != prev:
-                    decoded_seq.append(token)
-                prev = token
-
-            decoded.append(decoded_seq)
-
-        return decoded
-
-    def decode_beam_search(self, src, src_lengths=None, beam_size=10):
-        """
-        Beam Search解码
-        Args:
-            src: (B, T, n_mels)
-            src_lengths: (B,) - 实际长度
-            beam_size: beam宽度
-        Returns:
-            decoded: List[List[int]] - 解码结果
-        """
-        log_probs, output_lengths = self.forward(src, src_lengths)
-
-        decoded = []
-        for i in range(log_probs.size(0)):
-            length = output_lengths[i].item()
-            log_prob_seq = log_probs[i, :length, :]  # (T', vocab_size)
-            result = self._beam_search_single(log_prob_seq, beam_size)
-            decoded.append(result)
-
-        return decoded
-
-    def _beam_search_single(self, log_probs, beam_size):
-        """单个样本的beam search"""
-        T, vocab_size = log_probs.shape
-
-        # 初始化beam: [(prefix, log_prob_blank, log_prob_non_blank)]
-        beam = [([], 0.0, float('-inf'))]
-
-        for t in range(T):
-            new_beam = {}
-
-            for prefix, log_p_b, log_p_nb in beam:
-                for c in range(vocab_size):
-                    log_p_c = log_probs[t, c].item()
-
-                    if c == self.blank_id:
-                        # Blank: 不扩展序列
-                        new_prefix = tuple(prefix)
-                        new_log_p_b = self._log_add(log_p_b + log_p_c, log_p_nb + log_p_c)
-
-                        if new_prefix in new_beam:
-                            old_log_p_b, old_log_p_nb = new_beam[new_prefix]
-                            new_beam[new_prefix] = (
-                                self._log_add(old_log_p_b, new_log_p_b),
-                                old_log_p_nb
-                            )
-                        else:
-                            new_beam[new_prefix] = (new_log_p_b, float('-inf'))
-
-                    else:
-                        # 非blank token
-                        new_prefix = tuple(prefix + [c])
-
-                        if len(prefix) > 0 and prefix[-1] == c:
-                            # 重复字符: 只能从blank转移
-                            new_log_p_nb = log_p_b + log_p_c
-                        else:
-                            # 新字符
-                            new_log_p_nb = self._log_add(log_p_b + log_p_c, log_p_nb + log_p_c)
-
-                        if new_prefix in new_beam:
-                            old_log_p_b, old_log_p_nb = new_beam[new_prefix]
-                            new_beam[new_prefix] = (
-                                old_log_p_b,
-                                self._log_add(old_log_p_nb, new_log_p_nb)
-                            )
-                        else:
-                            new_beam[new_prefix] = (float('-inf'), new_log_p_nb)
-
-            # Pruning: 保留top beam_size
-            beam = []
-            for prefix, (log_p_b, log_p_nb) in new_beam.items():
-                total_log_p = self._log_add(log_p_b, log_p_nb)
-                beam.append((list(prefix), log_p_b, log_p_nb, total_log_p))
-
-            beam.sort(key=lambda x: x[3], reverse=True)
-            beam = [(prefix, log_p_b, log_p_nb) for prefix, log_p_b, log_p_nb, _ in beam[:beam_size]]
-
-        # 返回最佳序列
-        if beam:
-            return beam[0][0]
-        return []
-
-    def _log_add(self, log_a, log_b):
-        """log(exp(a) + exp(b))"""
-        if log_a == float('-inf'):
-            return log_b
-        if log_b == float('-inf'):
-            return log_a
-        if log_a > log_b:
-            return log_a + math.log1p(math.exp(log_b - log_a))
-        else:
-            return log_b + math.log1p(math.exp(log_a - log_b))
-
-
-if __name__ == '__main__':
-    # 测试
+from tokenizers import Tokenizer
+from model import CTCASR
+from tqdm import tqdm
+import argparse
+
+
+def load_model(checkpoint_path, tokenizer_file, device='cuda'):
+    """加载模型"""
+    tokenizer = Tokenizer.from_file(tokenizer_file)
+    vocab_size = tokenizer.get_vocab_size()
+    
     model = CTCASR(
         n_mels=80,
         d_model=512,
-        vocab_size=30,
+        nhead=8,
+        num_encoder_layers=12,
+        dim_feedforward=2048,
+        dropout=0.0,
+        vocab_size=vocab_size,
         blank_id=0,
-        use_spec_augment=True
+        use_cnn_subsampling=True,
+        use_spec_augment=False
     )
-
-    # 示例数据
-    audio = torch.randn(4, 1000, 80)
-    audio_lengths = torch.tensor([1000, 950, 900, 850])
-
-    # 前向
-    log_probs, output_lengths = model(audio, audio_lengths)
-    print(f"Log probs shape: {log_probs.shape}")
-    print(f"Output lengths: {output_lengths}")
-
-    # 解码
+    
+    checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    model.load_state_dict(checkpoint['model'])
+    model = model.to(device)
     model.eval()
-    decoded = model.decode_greedy(audio, audio_lengths)
-    print(f"Decoded (greedy): {decoded[0][:20]}")
+    
+    print(f"✓ Model loaded from {checkpoint_path}")
+    print(f"  Vocab size: {vocab_size}")
+    print(f"  Parameters: {sum(p.numel() for p in model.parameters()):,}")
+    
+    return model, tokenizer
 
-    decoded_beam = model.decode_beam_search(audio, audio_lengths, beam_size=10)
-    print(f"Decoded (beam): {decoded_beam[0][:20]}")
+
+def load_audio(audio_path):
+    """加载音频文件"""
+    audio_data = torch.load(audio_path, weights_only=False)
+    
+    # 处理不同格式
+    if isinstance(audio_data, dict):
+        # 预处理后的.pt文件
+        audio = audio_data['audio_features']
+        audio_length = audio_data.get('audio_length', audio.size(0))
+        text_gt = audio_data.get('text', None)
+        return audio, audio_length, text_gt
+    else:
+        # 直接是tensor
+        audio = audio_data
+        audio_length = audio.size(0)
+        return audio, audio_length, None
+
+
+def decode_tokens(tokens, tokenizer):
+    """Token → 文本"""
+    # 移除特殊tokens (0-4: BLANK, PAD, UNK, BOS, EOS)
+    filtered = [t for t in tokens if t >= 5]
+    if not filtered:
+        return ""
+    text = tokenizer.decode(filtered)
+    return text
+
+
+def calculate_wer(reference, hypothesis):
+    """计算 Character Error Rate"""
+    ref = reference.replace(' ', '').strip().lower()
+    hyp = hypothesis.replace(' ', '').strip().lower()
+    
+    if len(ref) == 0:
+        return 0.0 if len(hyp) == 0 else 1.0
+    
+    d = [[0] * (len(hyp) + 1) for _ in range(len(ref) + 1)]
+    
+    for i in range(len(ref) + 1):
+        d[i][0] = i
+    for j in range(len(hyp) + 1):
+        d[0][j] = j
+    
+    for i in range(1, len(ref) + 1):
+        for j in range(1, len(hyp) + 1):
+            cost = 0 if ref[i-1] == hyp[j-1] else 1
+            d[i][j] = min(d[i-1][j] + 1, d[i][j-1] + 1, d[i-1][j-1] + cost)
+    
+    return d[-1][-1] / len(ref)
+
+
+def infer_single(model, audio, audio_length, tokenizer, beam_size=None, device='cuda'):
+    """单个样本推理"""
+    audio = audio.to(device)
+    audio_length = torch.tensor([audio_length], device=device)
+    
+    with torch.no_grad():
+        if beam_size is None or beam_size == 1:
+            # Greedy
+            decoded = model.decode_greedy(audio.unsqueeze(0), audio_length)
+        else:
+            # Beam Search
+            decoded = model.decode_beam_search(audio.unsqueeze(0), audio_length, beam_size)
+    
+    tokens = decoded[0]
+    text = decode_tokens(tokens, tokenizer)
+    
+    return text, tokens
+
+
+def infer_batch(model, audio_list, tokenizer, beam_size=None, device='cuda'):
+    """批量推理"""
+    results = []
+    
+    for audio_path in tqdm(audio_list, desc="Inference"):
+        try:
+            audio, audio_length, text_gt = load_audio(audio_path)
+            text_pred, tokens = infer_single(model, audio, audio_length, tokenizer, beam_size, device)
+            
+            result = {
+                'file': audio_path,
+                'ground_truth': text_gt,
+                'prediction': text_pred,
+                'tokens': tokens
+            }
+            
+            if text_gt:
+                result['wer'] = calculate_wer(text_gt, text_pred)
+            
+            results.append(result)
+        except Exception as e:
+            print(f"Failed to process {audio_path}: {e}")
+    
+    return results
+
+
+def print_result(result, show_tokens=False):
+    """打印推理结果"""
+    print("\n" + "=" * 70)
+    print(f"File: {result['file']}")
+    if result.get('ground_truth'):
+        print(f"Ground Truth: {result['ground_truth']}")
+    print(f"Prediction:   {result['prediction']}")
+    if 'wer' in result:
+        print(f"WER: {result['wer']:.2f}%")
+    if show_tokens:
+        print(f"Tokens: {result['tokens'][:30]}...")
+    print("=" * 70)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='CTC Inference')
+    
+    # 必需参数
+    parser.add_argument('--checkpoint', required=True, help='模型checkpoint路径')
+    parser.add_argument('--tokenizer', default='tokenizer_ctc.json', help='Tokenizer文件')
+    
+    # 输入（二选一）
+    parser.add_argument('--audio', help='单个音频文件(.pt)')
+    parser.add_argument('--audio_list', help='音频文件列表（每行一个路径）')
+    parser.add_argument('--dataset_dir', help='数据集目录（配合metadata使用）')
+    parser.add_argument('--metadata', help='Metadata文件（train.txt/val.txt/test.txt）')
+    
+    # 推理参数
+    parser.add_argument('--beam_size', type=int, default=10, help='Beam size (1=greedy)')
+    parser.add_argument('--device', default='cuda', help='Device')
+    parser.add_argument('--show_tokens', action='store_true', help='显示tokens')
+    parser.add_argument('--output', help='输出结果到文件')
+    
+    args = parser.parse_args()
+    
+    # 检查输入
+    if not any([args.audio, args.audio_list, (args.dataset_dir and args.metadata)]):
+        parser.error("Must specify --audio, --audio_list, or --dataset_dir + --metadata")
+    
+    # 加载模型
+    print("Loading model...")
+    model, tokenizer = load_model(args.checkpoint, args.tokenizer, args.device)
+    
+    # 准备音频列表
+    audio_files = []
+    
+    if args.audio:
+        # 单个文件
+        audio_files = [args.audio]
+    
+    elif args.audio_list:
+        # 文件列表
+        with open(args.audio_list, 'r') as f:
+            audio_files = [line.strip() for line in f if line.strip()]
+    
+    elif args.dataset_dir and args.metadata:
+        # 从metadata加载
+        with open(args.metadata, 'r') as f:
+            metas = [line.strip().split()[0] for line in f if line.strip()]
+        audio_files = [os.path.join(args.dataset_dir, f'{meta}.pt') for meta in metas]
+    
+    print(f"\nProcessing {len(audio_files)} files...")
+    print(f"Beam size: {args.beam_size} ({'greedy' if args.beam_size == 1 else 'beam search'})")
+    
+    # 推理
+    if len(audio_files) == 1:
+        # 单个文件
+        audio, audio_length, text_gt = load_audio(audio_files[0])
+        print(f"\nAudio shape: {audio.shape}")
+        print(f"Audio length: {audio_length}")
+        if text_gt:
+            print(f"Ground truth: {text_gt}")
+        
+        print("\nInferencing...")
+        text_pred, tokens = infer_single(model, audio, audio_length, tokenizer, 
+                                        args.beam_size, args.device)
+        
+        result = {
+            'file': audio_files[0],
+            'ground_truth': text_gt,
+            'prediction': text_pred,
+            'tokens': tokens
+        }
+        if text_gt:
+            result['wer'] = calculate_wer(text_gt, text_pred)
+        
+        print_result(result, args.show_tokens)
+    
+    else:
+        # 批量推理
+        results = infer_batch(model, audio_files, tokenizer, args.beam_size, args.device)
+        
+        # 打印结果
+        for result in results[:5]:  # 只显示前5个
+            print_result(result, args.show_tokens)
+        
+        if len(results) > 5:
+            print(f"\n... ({len(results) - 5} more results)")
+        
+        # 统计
+        if any('wer' in r for r in results):
+            wers = [r['wer'] for r in results if 'wer' in r]
+            avg_wer = sum(wers) / len(wers)
+            print(f"\n{'=' * 70}")
+            print(f"Average WER: {avg_wer:.2f}%")
+            print(f"Samples: {len(wers)}")
+            print(f"{'=' * 70}")
+        
+        # 保存结果
+        if args.output:
+            with open(args.output, 'w', encoding='utf-8') as f:
+                for result in results:
+                    f.write(f"File: {result['file']}\n")
+                    if result.get('ground_truth'):
+                        f.write(f"GT:   {result['ground_truth']}\n")
+                    f.write(f"Pred: {result['prediction']}\n")
+                    if 'wer' in result:
+                        f.write(f"WER:  {result['wer']:.2f}%\n")
+                    f.write("\n")
+            print(f"\n✓ Results saved to {args.output}")
+
+
+if __name__ == '__main__':
+    main()
