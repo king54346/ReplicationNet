@@ -1,0 +1,819 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>3D 魔方模拟器</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #1a1a2e; color: #eee; font-family: 'Segoe UI', sans-serif;
+    overflow: hidden; height: 100vh; display: flex; flex-direction: column;
+  }
+  #canvas-container { flex: 1; position: relative; }
+  canvas { display: block; }
+
+  .controls {
+    background: rgba(16,16,40,0.95); padding: 12px 20px;
+    display: flex; flex-wrap: wrap; gap: 10px; align-items: center;
+    border-top: 1px solid #333;
+  }
+  .controls label { font-size: 13px; color: #aaa; white-space: nowrap; }
+  .controls input[type=text] {
+    flex: 1; min-width: 200px; padding: 6px 10px; border-radius: 6px;
+    border: 1px solid #555; background: #2a2a4a; color: #fff; font-size: 14px;
+    font-family: 'Consolas', monospace;
+  }
+  .controls input[type=text]:focus { outline: none; border-color: #7f5af0; }
+
+  .btn {
+    padding: 6px 14px; border: none; border-radius: 6px; cursor: pointer;
+    font-size: 13px; font-weight: 600; transition: all .15s;
+  }
+  .btn:hover { transform: translateY(-1px); }
+  .btn-primary { background: #7f5af0; color: #fff; }
+  .btn-primary:hover { background: #6b46e5; }
+  .btn-success { background: #2cb67d; color: #fff; }
+  .btn-success:hover { background: #25a06e; }
+  .btn-warning { background: #ff8906; color: #fff; }
+  .btn-warning:hover { background: #e07a00; }
+  .btn-danger  { background: #e53170; color: #fff; }
+  .btn-danger:hover  { background: #c82860; }
+  .btn-secondary { background: #444; color: #fff; }
+  .btn-secondary:hover { background: #555; }
+
+  .move-buttons {
+    background: rgba(16,16,40,0.95); padding: 8px 20px;
+    display: flex; flex-wrap: wrap; gap: 5px; align-items: center;
+    border-top: 1px solid #333;
+  }
+  .move-buttons .group-label {
+    font-size: 12px; color: #888; margin-right: 4px; min-width: 20px;
+  }
+  .move-btn {
+    padding: 4px 8px; border: 1px solid #555; border-radius: 4px;
+    background: #2a2a4a; color: #fff; cursor: pointer; font-size: 12px;
+    font-family: 'Consolas', monospace; transition: all .1s;
+  }
+  .move-btn:hover { background: #7f5af0; border-color: #7f5af0; }
+
+  #status-bar {
+    position: absolute; top: 10px; left: 50%; transform: translateX(-50%);
+    background: rgba(0,0,0,0.7); padding: 6px 16px; border-radius: 20px;
+    font-size: 14px; z-index: 10; pointer-events: none;
+    transition: all .3s;
+  }
+  #status-bar.solved { background: rgba(44,182,125,0.9); }
+
+  #history {
+    position: absolute; top: 10px; right: 10px;
+    background: rgba(0,0,0,0.6); padding: 8px 12px; border-radius: 8px;
+    font-size: 12px; max-width: 300px; max-height: 120px; overflow-y: auto;
+    z-index: 10; font-family: 'Consolas', monospace; color: #aaa;
+  }
+  #speed-control {
+    display: flex; align-items: center; gap: 5px;
+  }
+  #speed-control input[type=range] { width: 80px; }
+</style>
+</head>
+<body>
+
+<div id="canvas-container">
+  <div id="status-bar">🎲 3×3 魔方模拟器 — 拖拽旋转视角</div>
+  <div id="history">操作记录: <span id="history-text">无</span></div>
+</div>
+
+<div class="move-buttons">
+  <span class="group-label">U</span>
+  <button class="move-btn" onclick="execMoves('U')">U</button>
+  <button class="move-btn" onclick="execMoves('U\'')">U'</button>
+  <button class="move-btn" onclick="execMoves('U2')">U2</button>
+  <span class="group-label">D</span>
+  <button class="move-btn" onclick="execMoves('D')">D</button>
+  <button class="move-btn" onclick="execMoves('D\'')">D'</button>
+  <button class="move-btn" onclick="execMoves('D2')">D2</button>
+  <span class="group-label">F</span>
+  <button class="move-btn" onclick="execMoves('F')">F</button>
+  <button class="move-btn" onclick="execMoves('F\'')">F'</button>
+  <button class="move-btn" onclick="execMoves('F2')">F2</button>
+  <span class="group-label">B</span>
+  <button class="move-btn" onclick="execMoves('B')">B</button>
+  <button class="move-btn" onclick="execMoves('B\'')">B'</button>
+  <button class="move-btn" onclick="execMoves('B2')">B2</button>
+  <span class="group-label">R</span>
+  <button class="move-btn" onclick="execMoves('R')">R</button>
+  <button class="move-btn" onclick="execMoves('R\'')">R'</button>
+  <button class="move-btn" onclick="execMoves('R2')">R2</button>
+  <span class="group-label">L</span>
+  <button class="move-btn" onclick="execMoves('L')">L</button>
+  <button class="move-btn" onclick="execMoves('L\'')">L'</button>
+  <button class="move-btn" onclick="execMoves('L2')">L2</button>
+  <span class="group-label">M</span>
+  <button class="move-btn" onclick="execMoves('M')">M</button>
+  <button class="move-btn" onclick="execMoves('M\'')">M'</button>
+  <button class="move-btn" onclick="execMoves('M2')">M2</button>
+  <span class="group-label">x</span>
+  <button class="move-btn" onclick="execMoves('x')">x</button>
+  <button class="move-btn" onclick="execMoves('x\'')">x'</button>
+  <span class="group-label">y</span>
+  <button class="move-btn" onclick="execMoves('y')">y</button>
+  <button class="move-btn" onclick="execMoves('y\'')">y'</button>
+  <span class="group-label">z</span>
+  <button class="move-btn" onclick="execMoves('z')">z</button>
+  <button class="move-btn" onclick="execMoves('z\'')">z'</button>
+</div>
+
+<div class="controls">
+  <label>打乱/操作:</label>
+  <input type="text" id="scramble-input" placeholder="例: F R2 L' F' D B2 L2 D2 B'">
+  <button class="btn btn-primary" onclick="execInput('scramble-input')">▶ 执行</button>
+
+  <label>解法:</label>
+  <input type="text" id="solve-input" placeholder="例: D2 L2 F B' D' L' R2 F'">
+  <button class="btn btn-success" onclick="execInput('solve-input')">▶ 执行解法</button>
+
+  <button class="btn btn-warning" onclick="randomScramble()">🔀 随机打乱</button>
+  <button class="btn btn-danger" onclick="resetCube()">↺ 复原</button>
+  <button class="btn btn-secondary" onclick="undoMove()">⟲ 撤销</button>
+
+  <div id="speed-control">
+    <label>速度:</label>
+    <input type="range" id="speed" min="1" max="20" value="8">
+  </div>
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+// ─── 全局变量 ─────────────────────────────────────────────
+let scene, camera, renderer, controls;
+let cubies = [];        // 26 个小方块
+let cubeGroup;          // 整体容器
+let animating = false;
+let moveQueue = [];
+let moveHistory = [];
+
+const CUBIE_SIZE = 1;
+const GAP = 0.06;
+const UNIT = CUBIE_SIZE + GAP;
+const ROUND = 0.08;
+
+// 颜色方案
+const COLORS = {
+  U: 0xffffff, // 白
+  D: 0xffd500, // 黄
+  F: 0x009b48, // 绿
+  B: 0x0046ad, // 蓝
+  R: 0xb71234, // 红
+  L: 0xff5800, // 橙
+  inside: 0x1a1a1a,
+};
+
+// ─── 初始化 Three.js ────────────────────────────────────────
+function init() {
+  const container = document.getElementById('canvas-container');
+
+  scene = new THREE.Scene();
+  scene.background = new THREE.Color(0x1a1a2e);
+
+  camera = new THREE.PerspectiveCamera(45, container.clientWidth / container.clientHeight, 0.1, 100);
+  camera.position.set(5, 4, 5);
+
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+  renderer.setSize(container.clientWidth, container.clientHeight);
+  renderer.setPixelRatio(window.devicePixelRatio);
+  renderer.shadowMap.enabled = true;
+  container.appendChild(renderer.domElement);
+
+  // 光照
+  const ambient = new THREE.AmbientLight(0xffffff, 0.6);
+  scene.add(ambient);
+  const dir1 = new THREE.DirectionalLight(0xffffff, 0.8);
+  dir1.position.set(5, 10, 7);
+  scene.add(dir1);
+  const dir2 = new THREE.DirectionalLight(0xffffff, 0.3);
+  dir2.position.set(-5, -3, -5);
+  scene.add(dir2);
+
+  // 轨道控制
+  controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+  controls.minDistance = 4;
+  controls.maxDistance = 15;
+
+  cubeGroup = new THREE.Group();
+  scene.add(cubeGroup);
+
+  buildCube();
+  animate();
+
+  window.addEventListener('resize', () => {
+    camera.aspect = container.clientWidth / container.clientHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(container.clientWidth, container.clientHeight);
+  });
+}
+
+// ─── 构建单个 cubie ──────────────────────────────────────────
+function createCubie(x, y, z) {
+  const group = new THREE.Group();
+
+  // 内部黑色方块
+  const innerGeo = new THREE.BoxGeometry(CUBIE_SIZE * 0.98, CUBIE_SIZE * 0.98, CUBIE_SIZE * 0.98);
+  const innerMat = new THREE.MeshLambertMaterial({ color: COLORS.inside });
+  const inner = new THREE.Mesh(innerGeo, innerMat);
+  group.add(inner);
+
+  // 贴纸（6个面）
+  const stickerSize = CUBIE_SIZE * 0.85;
+  const stickerGeo = new THREE.PlaneGeometry(stickerSize, stickerSize);
+  // 圆角用RoundedRectangle
+  const roundGeo = createRoundedPlane(stickerSize, stickerSize, 0.08);
+
+  const faces = [
+    { dir: 'R', pos: [0.5, 0, 0], rot: [0, Math.PI / 2, 0], cond: x === 1 },
+    { dir: 'L', pos: [-0.5, 0, 0], rot: [0, -Math.PI / 2, 0], cond: x === -1 },
+    { dir: 'U', pos: [0, 0.5, 0], rot: [-Math.PI / 2, 0, 0], cond: y === 1 },
+    { dir: 'D', pos: [0, -0.5, 0], rot: [Math.PI / 2, 0, 0], cond: y === -1 },
+    { dir: 'F', pos: [0, 0, 0.5], rot: [0, 0, 0], cond: z === 1 },
+    { dir: 'B', pos: [0, 0, -0.5], rot: [0, Math.PI, 0], cond: z === -1 },
+  ];
+
+  faces.forEach(f => {
+    const color = f.cond ? COLORS[f.dir] : COLORS.inside;
+    const mat = new THREE.MeshLambertMaterial({ color, side: THREE.DoubleSide });
+    const sticker = new THREE.Mesh(roundGeo, mat);
+    sticker.position.set(...f.pos);
+    sticker.rotation.set(...f.rot);
+    sticker.userData.face = f.dir;
+    sticker.userData.isSticker = true;
+    sticker.userData.isOuter = f.cond;
+    group.add(sticker);
+  });
+
+  group.position.set(x * UNIT, y * UNIT, z * UNIT);
+  group.userData.basePos = { x, y, z };
+  return group;
+}
+
+function createRoundedPlane(w, h, r) {
+  const shape = new THREE.Shape();
+  const hw = w / 2, hh = h / 2;
+  shape.moveTo(-hw + r, -hh);
+  shape.lineTo(hw - r, -hh);
+  shape.quadraticCurveTo(hw, -hh, hw, -hh + r);
+  shape.lineTo(hw, hh - r);
+  shape.quadraticCurveTo(hw, hh, hw - r, hh);
+  shape.lineTo(-hw + r, hh);
+  shape.quadraticCurveTo(-hw, hh, -hw, hh - r);
+  shape.lineTo(-hw, -hh + r);
+  shape.quadraticCurveTo(-hw, -hh, -hw + r, -hh);
+  return new THREE.ShapeGeometry(shape);
+}
+
+// ─── 构建整个魔方 ─────────────────────────────────────────────
+function buildCube() {
+  // 清空
+  while (cubeGroup.children.length) cubeGroup.remove(cubeGroup.children[0]);
+  cubies = [];
+
+  for (let x = -1; x <= 1; x++)
+    for (let y = -1; y <= 1; y++)
+      for (let z = -1; z <= 1; z++) {
+        if (x === 0 && y === 0 && z === 0) continue;
+        const c = createCubie(x, y, z);
+        cubies.push(c);
+        cubeGroup.add(c);
+      }
+}
+
+// ─── 获取cubie的逻辑位置 ────────────────────────────────────
+function getLogicalPos(cubie) {
+  const p = cubie.position;
+  return {
+    x: Math.round(p.x / UNIT),
+    y: Math.round(p.y / UNIT),
+    z: Math.round(p.z / UNIT),
+  };
+}
+
+// ─── 选择某一层的 cubies ─────────────────────────────────────
+function selectLayer(axis, value) {
+  return cubies.filter(c => {
+    const lp = getLogicalPos(c);
+    return lp[axis] === value;
+  });
+}
+
+// ─── 动画旋转 ──────────────────────────────────────────────
+function animateRotation(axis, value, angle, callback) {
+  animating = true;
+  const layer = selectLayer(axis, value);
+  const pivot = new THREE.Group();
+  scene.add(pivot);
+
+  // 保存世界变换，移入 pivot
+  layer.forEach(c => {
+    cubeGroup.remove(c);
+    pivot.add(c);
+  });
+
+  const axisVec = new THREE.Vector3(
+    axis === 'x' ? 1 : 0,
+    axis === 'y' ? 1 : 0,
+    axis === 'z' ? 1 : 0,
+  );
+
+  const speed = parseInt(document.getElementById('speed').value) || 8;
+  const duration = 300 / speed; // ms
+  const startTime = performance.now();
+  const startQuat = pivot.quaternion.clone();
+  const endQuat = new THREE.Quaternion().setFromAxisAngle(axisVec, angle).multiply(startQuat);
+
+  function step(now) {
+    const t = Math.min((now - startTime) / duration, 1);
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    pivot.quaternion.slerpQuaternions(startQuat, endQuat, ease);
+
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      // 最终精确设置
+      pivot.quaternion.copy(endQuat);
+      pivot.updateMatrixWorld(true);
+
+      // 把 cubies 移回 cubeGroup
+      layer.forEach(c => {
+        const worldPos = new THREE.Vector3();
+        const worldQuat = new THREE.Quaternion();
+        c.getWorldPosition(worldPos);
+        c.getWorldQuaternion(worldQuat);
+
+        pivot.remove(c);
+        cubeGroup.add(c);
+
+        c.position.copy(worldPos);
+        c.quaternion.copy(worldQuat);
+
+        // 对齐到网格
+        c.position.x = Math.round(c.position.x / UNIT) * UNIT;
+        c.position.y = Math.round(c.position.y / UNIT) * UNIT;
+        c.position.z = Math.round(c.position.z / UNIT) * UNIT;
+
+        snapQuaternion(c);
+      });
+
+      scene.remove(pivot);
+      animating = false;
+      updateStatus();
+      if (callback) callback();
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+// 将四元数对齐到 90° 增量
+function snapQuaternion(obj) {
+  const euler = new THREE.Euler().setFromQuaternion(obj.quaternion, 'XYZ');
+  euler.x = Math.round(euler.x / (Math.PI / 2)) * (Math.PI / 2);
+  euler.y = Math.round(euler.y / (Math.PI / 2)) * (Math.PI / 2);
+  euler.z = Math.round(euler.z / (Math.PI / 2)) * (Math.PI / 2);
+  obj.quaternion.setFromEuler(euler);
+}
+
+// ─── 移动定义 ──────────────────────────────────────────────
+const MOVE_DEFS = {
+  'U':  { axis: 'y', value:  1, angle: -Math.PI / 2 },
+  "U'": { axis: 'y', value:  1, angle:  Math.PI / 2 },
+  'U2': { axis: 'y', value:  1, angle:  Math.PI },
+  'D':  { axis: 'y', value: -1, angle:  Math.PI / 2 },
+  "D'": { axis: 'y', value: -1, angle: -Math.PI / 2 },
+  'D2': { axis: 'y', value: -1, angle:  Math.PI },
+  'F':  { axis: 'z', value:  1, angle: -Math.PI / 2 },
+  "F'": { axis: 'z', value:  1, angle:  Math.PI / 2 },
+  'F2': { axis: 'z', value:  1, angle:  Math.PI },
+  'B':  { axis: 'z', value: -1, angle:  Math.PI / 2 },
+  "B'": { axis: 'z', value: -1, angle: -Math.PI / 2 },
+  'B2': { axis: 'z', value: -1, angle:  Math.PI },
+  'R':  { axis: 'x', value:  1, angle: -Math.PI / 2 },
+  "R'": { axis: 'x', value:  1, angle:  Math.PI / 2 },
+  'R2': { axis: 'x', value:  1, angle:  Math.PI },
+  'L':  { axis: 'x', value: -1, angle:  Math.PI / 2 },
+  "L'": { axis: 'x', value: -1, angle: -Math.PI / 2 },
+  'L2': { axis: 'x', value: -1, angle:  Math.PI },
+  // M: 中间层，与 L 方向相同
+  'M':  { axis: 'x', value:  0, angle:  Math.PI / 2 },
+  "M'": { axis: 'x', value:  0, angle: -Math.PI / 2 },
+  'M2': { axis: 'x', value:  0, angle:  Math.PI },
+  // E: 赤道层，与 D 同向
+  'E':  { axis: 'y', value:  0, angle:  Math.PI / 2 },
+  "E'": { axis: 'y', value:  0, angle: -Math.PI / 2 },
+  'E2': { axis: 'y', value:  0, angle:  Math.PI },
+  // S: 中间层，与 F 同向
+  'S':  { axis: 'z', value:  0, angle: -Math.PI / 2 },
+  "S'": { axis: 'z', value:  0, angle:  Math.PI / 2 },
+  'S2': { axis: 'z', value:  0, angle:  Math.PI },
+};
+
+// 整体旋转 x, y, z — 旋转全部三层
+function wholeRotation(axis, angle, callback) {
+  animating = true;
+  const pivot = new THREE.Group();
+  scene.add(pivot);
+
+  const allCubies = [...cubies];
+  allCubies.forEach(c => {
+    cubeGroup.remove(c);
+    pivot.add(c);
+  });
+
+  const axisVec = new THREE.Vector3(
+    axis === 'x' ? 1 : 0,
+    axis === 'y' ? 1 : 0,
+    axis === 'z' ? 1 : 0,
+  );
+
+  const speed = parseInt(document.getElementById('speed').value) || 8;
+  const duration = 400 / speed;
+  const startTime = performance.now();
+  const startQuat = pivot.quaternion.clone();
+  const endQuat = new THREE.Quaternion().setFromAxisAngle(axisVec, angle).multiply(startQuat);
+
+  function step(now) {
+    const t = Math.min((now - startTime) / duration, 1);
+    const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+    pivot.quaternion.slerpQuaternions(startQuat, endQuat, ease);
+    if (t < 1) {
+      requestAnimationFrame(step);
+    } else {
+      pivot.quaternion.copy(endQuat);
+      pivot.updateMatrixWorld(true);
+      allCubies.forEach(c => {
+        const wp = new THREE.Vector3();
+        const wq = new THREE.Quaternion();
+        c.getWorldPosition(wp);
+        c.getWorldQuaternion(wq);
+        pivot.remove(c);
+        cubeGroup.add(c);
+        c.position.copy(wp);
+        c.quaternion.copy(wq);
+        c.position.x = Math.round(c.position.x / UNIT) * UNIT;
+        c.position.y = Math.round(c.position.y / UNIT) * UNIT;
+        c.position.z = Math.round(c.position.z / UNIT) * UNIT;
+        snapQuaternion(c);
+      });
+      scene.remove(pivot);
+      animating = false;
+      updateStatus();
+      if (callback) callback();
+    }
+  }
+  requestAnimationFrame(step);
+}
+
+// ─── 执行单个动作 ─────────────────────────────────────────────
+function executeMove(move, callback) {
+  // 整体旋转
+  const wholeRotations = {
+    'x':  { axis: 'x', angle: -Math.PI / 2 },
+    "x'": { axis: 'x', angle:  Math.PI / 2 },
+    'x2': { axis: 'x', angle:  Math.PI },
+    'y':  { axis: 'y', angle: -Math.PI / 2 },
+    "y'": { axis: 'y', angle:  Math.PI / 2 },
+    'y2': { axis: 'y', angle:  Math.PI },
+    'z':  { axis: 'z', angle: -Math.PI / 2 },
+    "z'": { axis: 'z', angle:  Math.PI / 2 },
+    'z2': { axis: 'z', angle:  Math.PI },
+  };
+
+  if (wholeRotations[move]) {
+    const r = wholeRotations[move];
+    wholeRotation(r.axis, r.angle, callback);
+    return;
+  }
+
+  const def = MOVE_DEFS[move];
+  if (!def) {
+    console.warn('未知动作:', move);
+    if (callback) callback();
+    return;
+  }
+  animateRotation(def.axis, def.value, def.angle, callback);
+}
+
+// ─── 解析操作序列 ─────────────────────────────────────────────
+function parseMoves(str) {
+  const tokens = str.trim().split(/\s+/).filter(Boolean);
+  const moves = [];
+  for (const t of tokens) {
+    // 标准化: 替换 ' 为 '
+    const token = t.replace(/'/g, "'");
+    moves.push(token);
+  }
+  return moves;
+}
+
+// ─── 队列执行 ──────────────────────────────────────────────
+function processQueue() {
+  if (moveQueue.length === 0) return;
+  const move = moveQueue.shift();
+  moveHistory.push(move);
+  updateHistory();
+  executeMove(move, () => {
+    if (moveQueue.length > 0) {
+      processQueue();
+    }
+  });
+}
+
+function queueMoves(moves) {
+  moveQueue.push(...moves);
+  if (!animating) processQueue();
+}
+
+// ─── 检测是否还原 ────────────────────────────────────────────
+function isSolved() {
+  // 检查每个cubie是否回到初始位置且无旋转
+  for (const c of cubies) {
+    const bp = c.userData.basePos;
+    const lp = getLogicalPos(c);
+    if (lp.x !== bp.x || lp.y !== bp.y || lp.z !== bp.z) return false;
+    // 检查旋转
+    const e = new THREE.Euler().setFromQuaternion(c.quaternion, 'XYZ');
+    const rx = Math.round(e.x / (Math.PI / 2)) % 4;
+    const ry = Math.round(e.y / (Math.PI / 2)) % 4;
+    const rz = Math.round(e.z / (Math.PI / 2)) % 4;
+    if (rx !== 0 || ry !== 0 || rz !== 0) return false;
+  }
+  return true;
+}
+
+// 更精确的检测：检查每个面颜色是否一致
+function isSolvedByColor() {
+  // 获取六面每个位置的颜色
+  const faces = { U: [], D: [], F: [], B: [], R: [], L: [] };
+
+  for (const cubie of cubies) {
+    const lp = getLogicalPos(cubie);
+
+    cubie.traverse(child => {
+      if (child.isMesh && child.userData.isSticker) {
+        // 获取贴纸法线方向（世界坐标）
+        const normal = new THREE.Vector3(0, 0, 1);
+        normal.applyQuaternion(child.getWorldQuaternion(new THREE.Quaternion()));
+        normal.x = Math.round(normal.x);
+        normal.y = Math.round(normal.y);
+        normal.z = Math.round(normal.z);
+
+        let faceName = null;
+        if (normal.x === 1 && lp.x === 1) faceName = 'R';
+        else if (normal.x === -1 && lp.x === -1) faceName = 'L';
+        else if (normal.y === 1 && lp.y === 1) faceName = 'U';
+        else if (normal.y === -1 && lp.y === -1) faceName = 'D';
+        else if (normal.z === 1 && lp.z === 1) faceName = 'F';
+        else if (normal.z === -1 && lp.z === -1) faceName = 'B';
+
+        if (faceName) {
+          faces[faceName].push(child.material.color.getHex());
+        }
+      }
+    });
+  }
+
+  // 每面9个贴纸颜色应一致
+  for (const [name, colors] of Object.entries(faces)) {
+    if (colors.length < 8) return false; // 不含中心也应有8个角+棱
+    const unique = new Set(colors);
+    if (unique.size > 1) return false;
+  }
+  return true;
+}
+
+function updateStatus() {
+  const bar = document.getElementById('status-bar');
+  if (isSolvedByColor()) {
+    bar.textContent = '✅ 魔方已还原！';
+    bar.classList.add('solved');
+  } else {
+    bar.textContent = '🎲 3×3 魔方模拟器 — 拖拽旋转视角';
+    bar.classList.remove('solved');
+  }
+}
+
+function updateHistory() {
+  const el = document.getElementById('history-text');
+  if (moveHistory.length === 0) {
+    el.textContent = '无';
+  } else {
+    el.textContent = moveHistory.join(' ');
+  }
+}
+
+// ─── 渲染循环 ──────────────────────────────────────────────
+function animate() {
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene, camera);
+}
+
+// ─── 全局接口（供 HTML onclick 调用）────────────────────────
+window.execMoves = function (moveStr) {
+  if (animating || moveQueue.length > 0) return;
+  const moves = parseMoves(moveStr);
+  queueMoves(moves);
+};
+
+window.execInput = function (inputId) {
+  if (animating || moveQueue.length > 0) return;
+  const val = document.getElementById(inputId).value.trim();
+  if (!val) return;
+  const moves = parseMoves(val);
+  queueMoves(moves);
+};
+
+window.resetCube = function () {
+  if (animating) return;
+  moveQueue = [];
+  moveHistory = [];
+  buildCube();
+  updateStatus();
+  updateHistory();
+};
+
+window.undoMove = function () {
+  if (animating || moveQueue.length > 0 || moveHistory.length === 0) return;
+  const last = moveHistory.pop();
+  updateHistory();
+  // 执行逆操作（不记录到历史）
+  const inv = invertMove(last);
+  executeMove(inv, () => updateStatus());
+};
+
+function invertMove(move) {
+  if (move.endsWith('2')) return move; // 180° 的逆还是 180°
+  if (move.endsWith("'")) return move.slice(0, -1);
+  return move + "'";
+}
+
+window.randomScramble = function () {
+  if (animating || moveQueue.length > 0) return;
+  const faces = ['U', 'D', 'F', 'B', 'R', 'L'];
+  const mods = ['', "'", '2'];
+  const moves = [];
+  let lastFace = '';
+  for (let i = 0; i < 20; i++) {
+    let face;
+    do { face = faces[Math.floor(Math.random() * 6)]; } while (face === lastFace);
+    lastFace = face;
+    const mod = mods[Math.floor(Math.random() * 3)];
+    moves.push(face + mod);
+  }
+  const str = moves.join(' ');
+  document.getElementById('scramble-input').value = str;
+  queueMoves(moves);
+};
+
+// 键盘快捷键
+document.addEventListener('keydown', (e) => {
+  if (animating || moveQueue.length > 0) return;
+  if (e.target.tagName === 'INPUT') return;
+
+  const keyMap = {
+    'u': 'U', 'd': 'D', 'f': 'F', 'b': 'B', 'r': 'R', 'l': 'L', 'm': 'M',
+  };
+  const key = e.key.toLowerCase();
+  if (keyMap[key]) {
+    const move = e.shiftKey ? keyMap[key] + "'" : keyMap[key];
+    moveHistory.push(move);
+    updateHistory();
+    executeMove(move);
+  }
+  if (key === 'z' && e.ctrlKey) {
+    e.preventDefault();
+    window.undoMove();
+  }
+});
+
+// 启动
+init();
+
+// ─── 鼠标/触摸拖拽旋转魔方面 ────────────────────────────────
+(function setupFaceDrag() {
+  const _ray = new THREE.Raycaster();
+  let _drag = null;
+
+  // capture 阶段拦截，优先于 OrbitControls
+  const _container = document.getElementById('canvas-container');
+  _container.addEventListener('pointerdown', function(e) {
+    if (animating || moveQueue.length > 0 || e.button !== 0) return;
+
+    const rect = renderer.domElement.getBoundingClientRect();
+    const mx = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+    const my = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+
+    _ray.setFromCamera(new THREE.Vector2(mx, my), camera);
+
+    // 收集所有外部贴纸用于射线检测
+    const targets = [];
+    cubies.forEach(c => c.traverse(ch => {
+      if (ch.isMesh && ch.userData.isOuter) targets.push(ch);
+    }));
+
+    const hits = _ray.intersectObjects(targets);
+    if (!hits.length) return; // 没点到贴纸 → 交给 OrbitControls
+
+    // 阻止事件到达 OrbitControls，避免相机旋转
+    e.stopPropagation();
+
+    const sticker = hits[0].object;
+    // 获取贴纸在世界坐标系下的法线方向
+    const normal = new THREE.Vector3(0, 0, 1);
+    normal.applyQuaternion(sticker.getWorldQuaternion(new THREE.Quaternion()));
+    _snapVec(normal);
+
+    _drag = {
+      sx: e.clientX, sy: e.clientY,
+      normal: normal,
+      pos: getLogicalPos(sticker.parent),
+      done: false,
+    };
+  }, { capture: true });
+
+  document.addEventListener('pointermove', function(e) {
+    if (!_drag || _drag.done || animating) return;
+
+    const dx = e.clientX - _drag.sx;
+    const dy = e.clientY - _drag.sy;
+    if (dx * dx + dy * dy < 900) return; // 30px 拖拽阈值
+
+    // 将屏幕拖拽方向转换为 3D 世界方向
+    const sd = new THREE.Vector2(dx, -dy).normalize();
+    const camRight = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+    const camUp    = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    const drag3D   = new THREE.Vector3()
+      .addScaledVector(camRight, sd.x)
+      .addScaledVector(camUp, sd.y);
+
+    // 投影到面的平面上（去掉法线分量）
+    drag3D.addScaledVector(_drag.normal, -drag3D.dot(_drag.normal));
+    if (drag3D.lengthSq() < 1e-4) return;
+    drag3D.normalize();
+
+    // 旋转轴 = 面法线 × 拖拽方向
+    const cross = new THREE.Vector3().crossVectors(_drag.normal, drag3D);
+    _snapVec(cross);
+
+    // 确定旋转轴名称、层和角度
+    let axisName, sign;
+    if (Math.abs(cross.x) > 0.5)      { axisName = 'x'; sign = Math.sign(cross.x); }
+    else if (Math.abs(cross.y) > 0.5)  { axisName = 'y'; sign = Math.sign(cross.y); }
+    else                                { axisName = 'z'; sign = Math.sign(cross.z); }
+
+    const layer = _drag.pos[axisName];
+    const angle = (Math.PI / 2) * sign;
+
+    // 在 MOVE_DEFS 中查找对应的操作名
+    let moveName = '?';
+    for (const [k, v] of Object.entries(MOVE_DEFS)) {
+      if (v.axis === axisName && v.value === layer && Math.abs(v.angle - angle) < 0.01) {
+        moveName = k;
+        break;
+      }
+    }
+
+    _drag.done = true;
+    moveHistory.push(moveName);
+    updateHistory();
+    animateRotation(axisName, layer, angle, () => {
+      updateStatus();
+    });
+  });
+
+  document.addEventListener('pointerup', function() {
+    _drag = null;
+  });
+
+  // 将向量对齐到最近的主轴方向
+  function _snapVec(v) {
+    const ax = Math.abs(v.x), ay = Math.abs(v.y), az = Math.abs(v.z);
+    if (ax >= ay && ax >= az)      v.set(Math.sign(v.x) || 1, 0, 0);
+    else if (ay >= ax && ay >= az) v.set(0, Math.sign(v.y) || 1, 0);
+    else                            v.set(0, 0, Math.sign(v.z) || 1);
+  }
+})();
+</script>
+</body>
+</html>
+
