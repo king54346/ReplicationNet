@@ -6,7 +6,7 @@ from datasets import load_dataset
 
 
 def post_processing_chat(text):
-    return text.strip()
+    return text.strip(' ')
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. DPODataset —— 直接偏好优化（Direct Preference Optimization）数据集
 # ──────────────────────────────────────────────────────────────────────────────
@@ -31,17 +31,35 @@ class DPODataset(Dataset):
         self.max_length = max_length
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
-        # 预先 tokenize assistant 回复的起止标记
-        # Qwen3 的 bos_token = "<|im_start|>"，eos_token = "<|im_end|>"
-        # assistant 回复区间标记：<|im_start|>assistant\n ... <|im_end|>\n
+        # 直接 tokenize assistant 块的起始标记
+        # Qwen3 chat template 固定格式：<|im_start|>assistant\n
+        # '<|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n你好！<|im_end|>\n'
+        # 不管 thinking 开不开，这个前缀都存在
         self.bos_id = tokenizer(
-            f"{tokenizer.bos_token}assistant\n", add_special_tokens=False
-        ).input_ids
-        self.eos_id = tokenizer(
-            f"{tokenizer.eos_token}\n", add_special_tokens=False
+            "<|im_start|>assistant\n",
+            add_special_tokens=False
         ).input_ids
 
-        # 用 HuggingFace datasets 加载，支持大文件流式读取
+        # assistant 块结束标记：<|im_end|>\n
+        self.eos_id = tokenizer(
+            "<|im_end|>\n",
+            add_special_tokens=False
+        ).input_ids
+
+        print(f"bos_id tokens: {tokenizer.convert_ids_to_tokens(self.bos_id)}")
+        print(f"eos_id tokens: {tokenizer.convert_ids_to_tokens(self.eos_id)}")
+
+        # thinking 模式下 assistant 内容前有 <think>\n\n</think>\n\n
+        # 需要跳过这段，只对真正的回复内容做 mask
+        self.think_start_id = tokenizer(
+            "<think>",
+            add_special_tokens=False
+        ).input_ids
+        self.think_end_id = tokenizer(
+            "</think>\n\n",
+            add_special_tokens=False
+        ).input_ids
+
         self.samples = load_dataset("json", data_files=data_path, split="train")
         print(f"DPODataset 加载完成，共 {len(self.samples)} 条样本")
 
@@ -55,10 +73,20 @@ class DPODataset(Dataset):
 
         # Step 1：渲染为字符串
         chosen_prompt = post_processing_chat(
-            self.tokenizer.apply_chat_template(chosen, tokenize=False, add_generation_prompt=False)
+            self.tokenizer.apply_chat_template(
+                chosen,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,  # ← 加这行
+            )
         )
         rejected_prompt = post_processing_chat(
-            self.tokenizer.apply_chat_template(rejected, tokenize=False, add_generation_prompt=False)
+            self.tokenizer.apply_chat_template(
+                rejected,
+                tokenize=False,
+                add_generation_prompt=False,
+                enable_thinking=False,  # ← 加这行
+            )
         )
 
         # Step 2：tokenize + padding 到 max_length
@@ -123,3 +151,40 @@ class DPODataset(Dataset):
             else:
                 i += 1
         return loss_mask
+
+if __name__ == '__main__':
+    # 展示数据格式
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained("./model")
+    dataset = DPODataset("dpo.jsonl", tokenizer, max_length=512)
+    # dataset[i]  {
+    #   "x_chosen":              tensor([...], shape=[511])  # token ids
+    #   "y_chosen":              tensor([...], shape=[511])  # 自回归错位
+    #   "mask_chosen":           tensor([...], shape=[511])  # 0/1 mask
+    #   "x_rejected":            tensor([...], shape=[511])
+    #   "y_rejected":            tensor([...], shape=[511])
+    #   "mask_rejected":         tensor([...], shape=[511])
+    #   "attention_mask_chosen":  tensor([...], shape=[511])
+    #   "attention_mask_rejected":tensor([...], shape=[511])
+    # }
+    #
+    # x_chosen chosen 对话的输入 token ids，shape=[511]
+    # y_chosen chosen 对话的目标 token ids（x 错位一位），shape=[511] 本质是根据前文预测下一个词
+    # mask_chosen chosen 的 loss mask，只有 assistant 回复区间为 1，其余（user/system/padding）为 0
+    # x_rejected rejected 对话的输入 token ids
+    # y_rejected rejected 对话的目标 token ids
+    # mask_rejected rejected 的 loss mask，同上，只标记 assistant 回复区间
+    # attention_mask_chosen chosen 的注意力 mask，非 padding 位置为 1，padding 位置为 0
+    # attention_mask_rejected rejected 的注意力 mask，同上
+    print(dataset.samples[0])
+    # 验证 bos_id 在实际渲染序列里能被匹配到
+    sample = dataset.samples[0]
+    text = tokenizer.apply_chat_template(sample["chosen"], tokenize=False,
+                                        add_generation_prompt=False, enable_thinking=False)
+    ids = tokenizer(text, add_special_tokens=False).input_ids
+    mask = dataset.generate_loss_mask(ids + [tokenizer.pad_token_id] * (dataset.max_length - len(ids)))
+    print("mask sum:", sum(mask), "total:", len(ids))
+    # 把 mask=1 的位置 decode 出来看看是不是 assistant 回复
+    assistant_tokens = [tok for tok, m in zip(ids, mask[:len(ids)]) if m == 1]
+    print(tokenizer.decode(assistant_tokens))

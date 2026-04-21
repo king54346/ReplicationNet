@@ -1,7 +1,8 @@
 import os
 import sys
 
-from .dataset import DPODataset
+from dataset import DPODataset
+
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -52,13 +53,12 @@ def init_distributed_mode():
     return local_rank
 
 
-def get_lr(current_step, total_steps, base_lr, min_lr_ratio=0.1):
-    """余弦退火学习率，从 base_lr 衰减到 base_lr * min_lr_ratio"""
+def get_lr(current_step, total_steps, base_lr, warmup_steps=200, min_lr_ratio=0.1):
     import math
+    if current_step < warmup_steps:
+        return base_lr * current_step / max(1, warmup_steps)
     min_lr = base_lr * min_lr_ratio
-    if current_step >= total_steps:
-        return min_lr
-    progress = current_step / total_steps
+    progress = (current_step - warmup_steps) / max(1, total_steps - warmup_steps)
     cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
     return min_lr + (base_lr - min_lr) * cosine_decay
 
@@ -161,41 +161,36 @@ def logits_to_log_probs(logits, labels):
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
-    """
-    DPO Loss：
-    L = -log σ( β * ( (π(y_w) - π_ref(y_w)) - (π(y_l) - π_ref(y_l)) ) )
-    y_w   preferred response（人类偏好的"好"回答）
-    y_l   rejected response（人类不偏好的"差"回答）
-    π(y)  当前训练中的 policy model 对回答 y 的 log probability
-    π_ref(y) 冻结的reference model（通常是 SFT 模型）的 log probability
-    β   控制偏离 reference model 程度的超参数
-    σ   sigmoid 函数
-
-    输入的 ref_log_probs / policy_log_probs 形状 [2B, S]，
-    前半 B 是 chosen，后半 B 是 rejected。
-    """
-    # 序列长度（每条序列有效 token 数），防止除零
-    seq_lengths = mask.sum(dim=1).clamp_min(1.0)           # [2B]
-
-    # 对有效位置的 log 概率求均值，得到每条序列的标量 log 概率
-    ref_logp    = (ref_log_probs    * mask).sum(dim=1) / seq_lengths   # [2B]
-    policy_logp = (policy_log_probs * mask).sum(dim=1) / seq_lengths   # [2B]
+    # 直接 sum，不做长度归一化（标准 DPO）
+    ref_logp    = (ref_log_probs * mask).sum(dim=1)       # [2B]
+    policy_logp = (policy_log_probs * mask).sum(dim=1)    # [2B]
 
     B = ref_logp.shape[0] // 2
-    chosen_ref_logp    = ref_logp[:B]
-    rejected_ref_logp  = ref_logp[B:]
-    chosen_policy_logp = policy_logp[:B]
-    rejected_policy_logp = policy_logp[B:]
+    chosen_ref_logp,    rejected_ref_logp    = ref_logp[:B],    ref_logp[B:]
+    chosen_policy_logp, rejected_policy_logp = policy_logp[:B], policy_logp[B:]
 
-    # 策略模型偏好差：chosen - rejected
-    pi_logratios  = chosen_policy_logp  - rejected_policy_logp   # [B]
-    # 参考模型偏好差：chosen - rejected（作为基准）
-    ref_logratios = chosen_ref_logp     - rejected_ref_logp       # [B]
+    pi_logratios  = chosen_policy_logp - rejected_policy_logp
+    ref_logratios = chosen_ref_logp - rejected_ref_logp   # ref 本来就 no_grad，不需要 detach
 
-    # DPO 核心：策略相对于参考的"净偏好"
-    logits = pi_logratios - ref_logratios                          # [B]
-    loss   = -F.logsigmoid(beta * logits)                         # [B]
-    return loss.mean()
+    logits = pi_logratios - ref_logratios
+    logits = torch.clamp(logits, -20, 20)   # 防数值爆炸，可保留
+
+    loss = -F.logsigmoid(beta * logits).mean()
+
+    # 诊断指标：DPO 训练状态的真正体检表
+    with torch.no_grad():
+        chosen_reward   = beta * (chosen_policy_logp - chosen_ref_logp).mean()
+        rejected_reward = beta * (rejected_policy_logp - rejected_ref_logp).mean()
+        reward_margin   = chosen_reward - rejected_reward
+        accuracy        = (pi_logratios > ref_logratios).float().mean()
+
+    return loss, {
+        "logits_mean":     logits.mean().item(),
+        "chosen_reward":   chosen_reward.item(),
+        "rejected_reward": rejected_reward.item(),
+        "reward_margin":   reward_margin.item(),
+        "accuracy":        accuracy.item(),
+    }
 
 
 # ==========训练一个 Epoch==========
@@ -215,6 +210,8 @@ def train_epoch(
 ):
     model.train()
     start_time = time.time()
+    logits_buf = []
+    logits_global = []   # 全局累积，用于趋势判断
 
     for step, batch in enumerate(loader, start=start_step + 1):
         x_chosen   = batch["x_chosen"].to(args.device)
@@ -244,8 +241,11 @@ def train_epoch(
         with autocast_ctx:
             # ——— 参考模型前向（冻结，无梯度）———
             with torch.no_grad():
-                ref_out    = ref_model(x, attention_mask=attention_mask)
-                ref_logits = ref_out.logits                          # [2B, S, V]
+                ref_out = ref_model(
+                    x.to(ref_input_device),
+                    attention_mask=attention_mask.to(ref_input_device),
+                )
+                ref_logits = ref_out.logits.to(args.device)   # 搬回主卡做 loss
 
             # ——— 策略模型前向 ———
             out    = model(x, attention_mask=attention_mask)
@@ -257,7 +257,9 @@ def train_epoch(
             policy_log_probs = logits_to_log_probs(logits,     y)   # [2B, S]
 
             # DPO Loss（mask 与 y 已经对齐，直接传入）
-            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=args.beta)
+            dpo_loss_val, metrics = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=args.beta)
+            logits_buf.append(metrics["logits_mean"])
+            logits_global.append(metrics["logits_mean"])
 
             # MoE 辅助损失（非 MoE 模型 aux_loss=0）
             aux_loss = getattr(out, "aux_loss", torch.tensor(0.0, device=args.device))
@@ -278,13 +280,19 @@ def train_epoch(
             cur_loss  = loss.item() * args.accumulation_steps
             cur_lr    = optimizer.param_groups[-1]["lr"]
             eta_min   = elapsed / (step + 1) * iters // 60 - elapsed // 60
+            mean_logits = sum(logits_buf) / len(logits_buf) if logits_buf else 0.0
+            global_mean = sum(logits_global) / len(logits_global)
+            logits_buf.clear()
 
             Logger(
                 f"Epoch:[{epoch+1}/{args.epochs}]({step}/{iters}) "
-                f"loss:{cur_loss:.6f} lr:{cur_lr:.2e} eta:{eta_min:.0f}min"
+                f"loss:{cur_loss:.4f} lr:{cur_lr:.2e} "
+                f"acc:{metrics['accuracy']:.3f} margin:{metrics['reward_margin']:+.3f} "
+                f"ch_rw:{metrics['chosen_reward']:+.3f} rj_rw:{metrics['rejected_reward']:+.3f} "
+                f"eta:{eta_min:.0f}min"
             )
             if wandb:
-                wandb.log({"loss": cur_loss, "lr": cur_lr, "eta_min": eta_min})
+                wandb.log({"loss": cur_loss, "lr": cur_lr, "logits_mean": mean_logits, "eta_min": eta_min})
 
         # ——— 保存 checkpoint ———
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
@@ -438,8 +446,10 @@ if __name__ == "__main__":
         args.model_path,
         torch_dtype=dtype,
         trust_remote_code=True,
-        device_map=args.device,
+        device_map=args.device
     )
+    model.gradient_checkpointing_enable()
+    model.enable_input_require_grads()  # ← 必须加，否则反向传播断链
     Logger(f"策略模型参数量：{sum(p.numel() for p in model.parameters()) / 1e9:.2f}B")
 
     # ========== 6. 加载参考模型（Reference，冻结）==========
@@ -450,10 +460,11 @@ if __name__ == "__main__":
         args.model_path,
         torch_dtype=dtype,
         trust_remote_code=True,
-        device_map=args.device,
+        device_map="auto",
     ).eval().requires_grad_(False)
     Logger(f"参考模型参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e9:.2f}B")
-
+    ref_input_device = ref_model.get_input_embeddings().weight.device
+    Logger(f"ref_model input device: {ref_input_device}")
     # ========== 7. 数据集 & 优化器 ==========
     train_ds = DPODataset(args.data_path, tokenizer, max_length=args.max_seq_len)
     train_sampler = DistributedSampler(train_ds) if dist.is_initialized() else None
