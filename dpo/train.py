@@ -161,9 +161,10 @@ def logits_to_log_probs(logits, labels):
 
 
 def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
-    # 直接 sum，不做长度归一化（标准 DPO）
-    ref_logp    = (ref_log_probs * mask).sum(dim=1)       # [2B]
-    policy_logp = (policy_log_probs * mask).sum(dim=1)    # [2B]
+    # 长度归一化：除以每条序列的有效 token 数，避免长回答占优
+    seq_len     = mask.sum(dim=1).clamp(min=1)            # [2B]，防止除以 0
+    ref_logp    = (ref_log_probs * mask).sum(dim=1) / seq_len   # [2B]
+    policy_logp = (policy_log_probs * mask).sum(dim=1) / seq_len  # [2B]
 
     B = ref_logp.shape[0] // 2
     chosen_ref_logp,    rejected_ref_logp    = ref_logp[:B],    ref_logp[B:]
