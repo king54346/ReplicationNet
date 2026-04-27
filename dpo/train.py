@@ -101,7 +101,7 @@ def build_dataset(data_path: str) -> Dataset:
 
 
 # ──────────────────────────────────────────────────────────
-# 主函数
+# 主函数 accelerate launch train.py     --model_path ./model     --sft_first     --sft_epochs 3     --epochs 10
 # ──────────────────────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Qwen3 DPO 训练（基于 TRL）")
