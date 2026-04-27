@@ -168,9 +168,36 @@ if __name__ == '__main__':
     #   "attention_mask_chosen":  tensor([...], shape=[511])
     #   "attention_mask_rejected":tensor([...], shape=[511])
     # }
+    # 举例：
+    # x_chosen:               模型输入序列（chosen，去掉最后一个token）
+    #                         → [im_start, user, \n, 是~还有你嘛, im_end, \n, im_start, asst, \n, 你个傻逼..., im_end]
+    #
+    # y_chosen:               预测目标（chosen，去掉第一个token，左移一位）
+    #                         → [user, \n, 是~还有你嘛, im_end, \n, im_start, asst, \n, 你个傻逼..., im_end, pad]
+    #
+    # mask_chosen:            loss mask（只有 assistant content 是 1）
+    #                         → [0,0,0,...,0, 1,1,1,1,1,1,1,1, 0]
+    #                                         ↑"你个傻逼..."↑
+    #
+    # x_rejected:             模型输入序列（rejected）
+    #                         → [im_start, user, \n, 是~还有你嘛, im_end, \n, im_start, asst, \n, 我是AI..., im_end]
+    #
+    # y_rejected:             预测目标（rejected）
+    #                         → [user, \n, 是~还有你嘛, im_end, \n, im_start, asst, \n, 我是AI..., im_end, pad]
+    #
+    # mask_rejected:          loss mask（只有 assistant content 是 1）
+    #                         → [0,0,0,...,0, 1,1,1,1,1,1,1,1,1, 0]
+    #                                         ↑"我是AI..."↑
+    #
+    # attention_mask_chosen:  真实token位置是1，pad位置是0（基于 x_chosen）
+    #                         → [1,1,1,...,1,1,0,0]
+    #
+    # attention_mask_rejected:真实token位置是1，pad位置是0（基于 x_rejected）
+    #                         → [1,1,1,...,1,1,0,0,0]  ← rejected 回答更长，pad 更少
     #
     # x_chosen chosen 对话的输入 token ids，shape=[511]
     # y_chosen chosen 对话的目标 token ids（x 错位一位），shape=[511] 本质是根据前文预测下一个词
+    # 例如 输入位置i 看到 x[i] 预测 y[i]
     # mask_chosen chosen 的 loss mask，只有 assistant 回复区间为 1，其余（user/system/padding）为 0
     # x_rejected rejected 对话的输入 token ids
     # y_rejected rejected 对话的目标 token ids
